@@ -6,7 +6,7 @@ Sends code chunks to Amazon Nova Multimodal Embeddings via Bedrock
 (boto3 InvokeModel) and returns embedding vectors.
 
 Design rules:
-- Boto3 first: InvokeModel against amazon.nova-embed-v1:0
+- Boto3 first: InvokeModel against amazon.nova-2-multimodal-embeddings-v1:0
 - Batching: Bedrock accepts one embedding per call; we parallelize with a
   thread pool to keep indexing fast without exceeding service limits
 - Rate limiting: exponential backoff on ThrottlingException
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Model ID matches ENV.md: NOVA_EMBEDDING_MODEL_ID
-DEFAULT_MODEL_ID = os.getenv("NOVA_EMBEDDING_MODEL_ID", "amazon.nova-embed-v1:0")
+DEFAULT_MODEL_ID = os.getenv("NOVA_EMBEDDING_MODEL_ID", "amazon.nova-2-multimodal-embeddings-v1:0")
 DEFAULT_REGION   = os.getenv("AWS_BEDROCK_REGION", os.getenv("AWS_REGION", "us-east-1"))
 
 # Bedrock embedding throughput limits — tune these for your account tier
@@ -43,6 +43,9 @@ BASE_BACKOFF     = 1.0   # seconds, doubles on each retry
 # Nova Multimodal Embeddings max input length (characters)
 # Text longer than this is truncated — chunking in repo_loader keeps us well under
 MAX_CONTENT_CHARS = 8000
+
+# Nova 2 Multimodal Embeddings output dimension (1024 = best accuracy/storage balance)
+EMBEDDING_DIMENSION = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +140,7 @@ def embed_query(
     client = _get_bedrock_client(reg)
 
     logger.debug("Embedding query (%d chars) via %s", len(query), model)
-    vector = _invoke_embedding(client, model, _truncate(query))
+    vector = _invoke_embedding(client, model, _truncate(query), purpose="GENERIC_RETRIEVAL")
     return vector
 
 
@@ -174,17 +177,42 @@ def _embed_single(client, model_id: str, chunk: dict) -> EmbeddedChunk:
     )
 
 
-def _invoke_embedding(client, model_id: str, text: str) -> list[float]:
+def _invoke_embedding(
+    client,
+    model_id: str,
+    text: str,
+    purpose: str = "GENERIC_INDEX",
+) -> list[float]:
     """
-    Call Bedrock InvokeModel for Nova Multimodal Embeddings with retry/backoff.
+    Call Bedrock InvokeModel for Nova 2 Multimodal Embeddings with retry/backoff.
 
-    Nova Multimodal Embeddings request body:
-        { "inputText": "<text>" }
+    Nova 2 Multimodal Embeddings request body:
+        {
+            "taskType": "SINGLE_EMBEDDING",
+            "singleEmbeddingParams": {
+                "embeddingPurpose": "GENERIC_INDEX" | "GENERIC_RETRIEVAL",
+                "embeddingDimension": 1024,
+                "text": {"truncationMode": "END", "value": "<text>"}
+            }
+        }
 
     Response body:
-        { "embedding": [float, ...], "inputTextTokenCount": int }
+        { "embedding": [float, ...] }
+
+    Args:
+        purpose: "GENERIC_INDEX" for indexing chunks, "GENERIC_RETRIEVAL" for queries.
     """
-    body = json.dumps({"inputText": text})
+    body = json.dumps({
+        "taskType": "SINGLE_EMBEDDING",
+        "singleEmbeddingParams": {
+            "embeddingPurpose": purpose,
+            "embeddingDimension": EMBEDDING_DIMENSION,
+            "text": {
+                "truncationMode": "END",
+                "value": text,
+            },
+        },
+    })
     backoff = BASE_BACKOFF
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -196,7 +224,8 @@ def _invoke_embedding(client, model_id: str, text: str) -> list[float]:
                 accept="application/json",
             )
             response_body = json.loads(response["body"].read())
-            return response_body["embedding"]
+            # Nova 2 Multimodal Embeddings: {"embeddings": [{"embeddingType": "TEXT", "embedding": [...]}]}
+            return response_body["embeddings"][0]["embedding"]
 
         except ClientError as exc:
             code = exc.response["Error"]["Code"]

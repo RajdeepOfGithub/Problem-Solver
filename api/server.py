@@ -1036,6 +1036,7 @@ if __name__ == "__main__":
         host=API_HOST,
         port=API_PORT,
         reload=True,
+        reload_excludes=["data/*", "*.log"],
         log_level="info",
     )
 
