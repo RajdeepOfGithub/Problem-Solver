@@ -1,0 +1,40 @@
+# Vega — Python Dependencies
+# Fill in versions before Phase 2 begins
+
+# AWS
+boto3
+botocore
+
+# Amazon Bedrock / Nova
+# boto3 covers Bedrock SDK calls
+strands-agents          # Strands BidiAgent framework for Nova Sonic bidirectional streaming
+aws-sdk-bedrock-runtime # Required by strands BidiNovaSonicModel (direct bidirectional stream SDK)
+
+# Nova Act
+# nova-act  # add package name once confirmed
+
+# Vector Store
+faiss-cpu
+numpy
+
+# Orchestration
+langgraph
+
+# API
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+
+# Auth / Sessions
+python-jose[cryptography]   # JWT session tokens
+passlib[bcrypt]
+
+# GitHub
+PyGithub
+GitPython   # git (repo cloning in ingestion/repo_loader.py)
+
+# Utilities
+python-dotenv
+pydantic
+httpx

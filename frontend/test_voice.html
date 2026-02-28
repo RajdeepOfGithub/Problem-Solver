@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vega Voice Test Console</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Cascadia Code", "Fira Code", "Menlo", monospace;
+      font-size: 13px;
+      background: #0d1117;
+      color: #c9d1d9;
+      padding: 20px;
+      min-height: 100vh;
+    }
+
+    h1 { font-size: 18px; color: #e6edf3; margin-bottom: 6px; }
+    h2 { font-size: 13px; color: #8b949e; text-transform: uppercase;
+         letter-spacing: 0.05em; margin-bottom: 10px; }
+
+    .notice {
+      background: #161b22;
+      border: 1px solid #f0883e55;
+      border-left: 3px solid #f0883e;
+      border-radius: 4px;
+      padding: 10px 14px;
+      margin: 12px 0;
+      color: #c9d1d9;
+      line-height: 1.6;
+    }
+    .notice code {
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 3px;
+      padding: 1px 5px;
+      color: #79c0ff;
+      font-size: 12px;
+    }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 16px;
+    }
+    .panel-wide {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 16px;
+      margin-top: 16px;
+    }
+
+    label { display: block; color: #8b949e; margin-bottom: 4px; font-size: 12px; }
+    .field-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 10px; }
+    .field { display: flex; flex-direction: column; flex: 1; min-width: 120px; }
+    input, select {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      color: #c9d1d9;
+      padding: 6px 8px;
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: #388bfd; }
+
+    button {
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #c9d1d9;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      padding: 6px 14px;
+      transition: background 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+    button:hover:not(:disabled) { background: #30363d; border-color: #8b949e; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+    button.primary:hover:not(:disabled) { background: #2ea043; }
+    button.danger  { background: #da3633; border-color: #f85149; color: #fff; }
+    button.danger:hover:not(:disabled)  { background: #f85149; }
+
+    .status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      flex-shrink: 0; transition: background 0.3s;
+    }
+    .dot.disconnected { background: #6e7681; }
+    .dot.connecting   { background: #d29922; animation: pulse 1s infinite; }
+    .dot.connected    { background: #3fb950; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    #status-label { font-weight: 600; color: #e6edf3; }
+
+    /* Record button */
+    #btn-record {
+      width: 100%; padding: 14px;
+      font-size: 15px; font-weight: 600;
+      border: 2px solid #388bfd;
+      color: #388bfd;
+      background: #0d1117;
+      border-radius: 8px;
+      user-select: none;
+      -webkit-user-select: none;
+      transition: background 0.1s, color 0.1s, transform 0.1s;
+    }
+    #btn-record:hover:not(:disabled) { background: #1c2a3a; }
+    #btn-record.recording {
+      background: #da3633;
+      border-color: #f85149;
+      color: #fff;
+      transform: scale(0.98);
+      animation: rec-pulse 0.8s ease-in-out infinite;
+    }
+    @keyframes rec-pulse {
+      0%,100% { box-shadow: 0 0 0 0 #da363355; }
+      50%      { box-shadow: 0 0 0 8px transparent; }
+    }
+
+    /* Session info pills */
+    .info-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .pill {
+      background: #21262d; border: 1px solid #30363d; border-radius: 20px;
+      padding: 3px 10px; font-size: 12px; color: #8b949e;
+    }
+    .pill span { color: #79c0ff; }
+
+    /* Log */
+    #log {
+      height: 360px;
+      overflow-y: auto;
+      background: #0d1117;
+      border: 1px solid #21262d;
+      border-radius: 4px;
+      padding: 10px;
+      font-size: 12px;
+      line-height: 1.6;
+      scroll-behavior: smooth;
+    }
+    #log:empty::before { content: "— waiting for frames —"; color: #6e7681; }
+    .log-entry { padding: 2px 0; border-bottom: 1px solid #161b22; }
+    .log-ts    { color: #6e7681; }
+    .log-tag   { font-weight: 700; padding: 0 4px; border-radius: 3px; font-size: 11px; }
+
+    .log-info       .log-tag { background: #1c2a3a; color: #79c0ff; }
+    .log-success    .log-tag { background: #122a1a; color: #3fb950; }
+    .log-warn       .log-tag { background: #2d2208; color: #d29922; }
+    .log-error      .log-tag { background: #2d0f0f; color: #f85149; }
+    .log-transcript .log-tag { background: #1e1b2e; color: #bc8cff; }
+    .log-action     .log-tag { background: #1a2030; color: #58a6ff; }
+    .log-confirm    .log-tag { background: #2a1a10; color: #f0883e; }
+    .log-audio      .log-tag { background: #0f2020; color: #39c5cf; }
+
+    .log-error   .log-body { color: #f85149; }
+    .log-confirm .log-body { color: #f0883e; }
+
+    .log-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .log-controls label { margin: 0; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+    /* Recording indicator — persistent banner at top of viewport */
+    #recording-banner {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 1000;
+      background: #da3633;
+      color: #fff;
+      text-align: center;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 6px 0;
+      letter-spacing: 0.04em;
+      animation: rec-banner-pulse 1s ease-in-out infinite;
+    }
+    #recording-banner.active { display: block; }
+    @keyframes rec-banner-pulse {
+      0%,100% { opacity: 1; }
+      50%     { opacity: 0.7; }
+    }
+    body.is-recording { border-top: 3px solid #f85149; padding-top: 40px; }
+  </style>
+</head>
+<body>
+
+<div id="recording-banner">RECORDING</div>
+<h1>&#127897; Vega Voice Test Console</h1>
+<p style="color:#6e7681;margin-top:4px;">Dev testing tool — Phase 4 voice &#8594; orchestrator loop</p>
+
+<div class="notice">
+  <strong style="color:#f0883e;">&#9888; WebSocket auth note</strong><br>
+  Browser WebSocket cannot send custom <code>Authorization</code> headers.
+  This tool passes the token via <code>?token=</code> query param.
+  Add the following fallback to <code>api/server.py</code> in the
+  <code>websocket_voice</code> handler (<strong>one line</strong>):<br><br>
+  <code>auth_header = websocket.headers.get("Authorization", "") or
+    f"Bearer {websocket.query_params.get('token', '')}"</code>
+</div>
+
+<div class="grid">
+
+  <!-- ── Panel 1: Session ─────────────────────────────────────── -->
+  <div class="panel">
+    <h2>1 · Session</h2>
+    <div class="field-row">
+      <div class="field">
+        <label>Server URL</label>
+        <input id="server-url" value="http://localhost:8000">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Mode</label>
+        <select id="mode">
+          <option value="dev">dev</option>
+          <option value="ops">ops</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Repo ID</label>
+        <input id="repo-id" value="test">
+      </div>
+    </div>
+    <div class="field-row">
+      <button class="primary" id="btn-start-session">Start Session</button>
+    </div>
+    <div style="color:#6e7681;font-size:12px;margin:8px 0 4px;">
+      Or paste existing credentials:
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Session ID</label>
+        <input id="session-id-input" placeholder="sess_xxxxxxxx">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Bearer Token</label>
+        <input id="token-input" placeholder="paste token here">
+      </div>
+    </div>
+    <div class="info-row" id="session-pills" style="display:none;">
+      <div class="pill">session_id: <span id="pill-session-id">—</span></div>
+      <div class="pill">token: <span id="pill-token">—</span></div>
+    </div>
+  </div>
+
+  <!-- ── Panel 2: Connection ──────────────────────────────────── -->
+  <div class="panel">
+    <h2>2 · Connection</h2>
+    <div class="status-row">
+      <div class="dot disconnected" id="status-dot"></div>
+      <span id="status-label">Disconnected</span>
+    </div>
+    <div class="field-row">
+      <button class="primary" id="btn-connect">Connect</button>
+      <button class="danger" id="btn-disconnect" disabled>Disconnect</button>
+    </div>
+
+    <h2 style="margin-top:20px;">3 · Record</h2>
+    <button id="btn-record" disabled>&#127897;&nbsp; Hold to Talk</button>
+    <div style="color:#6e7681;font-size:11px;margin-top:8px;text-align:center;">
+      Press and hold to record · Release to send utterance
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Log panel ──────────────────────────────────────────────── -->
+<div class="panel-wide">
+  <h2>Frame Log</h2>
+  <div class="log-controls">
+    <button id="btn-clear">Clear</button>
+    <label>
+      <input type="checkbox" id="chk-audio-log">
+      Show response_audio frames
+    </label>
+  </div>
+  <div id="log"></div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────
+let ws             = null;
+let audioCtxIn     = null;   // AudioContext for recording input
+let scriptProc     = null;
+let micStream      = null;
+let recording      = false;
+let sessionToken   = null;
+let sessionId      = null;
+
+// Gapless PCM playback
+let playbackCtx    = null;
+let nextPlayTime   = 0;
+
+const SAMPLE_RATE  = 16000;
+const BUFFER_SIZE  = 4096;   // ~256ms chunks at 16kHz
+
+// ─────────────────────────────────────────────────────────────────
+// DOM refs
+// ─────────────────────────────────────────────────────────────────
+const elServerUrl       = document.getElementById('server-url');
+const elMode            = document.getElementById('mode');
+const elRepoId          = document.getElementById('repo-id');
+const elSessionIdInput  = document.getElementById('session-id-input');
+const elTokenInput      = document.getElementById('token-input');
+const elPillSessionId   = document.getElementById('pill-session-id');
+const elPillToken       = document.getElementById('pill-token');
+const elSessionPills    = document.getElementById('session-pills');
+const elStatusDot       = document.getElementById('status-dot');
+const elStatusLabel     = document.getElementById('status-label');
+const elLog             = document.getElementById('log');
+const chkAudioLog       = document.getElementById('chk-audio-log');
+const btnStartSession   = document.getElementById('btn-start-session');
+const btnConnect        = document.getElementById('btn-connect');
+const btnDisconnect     = document.getElementById('btn-disconnect');
+const btnRecord         = document.getElementById('btn-record');
+const btnClear          = document.getElementById('btn-clear');
+
+// ─────────────────────────────────────────────────────────────────
+// Logging helpers
+// ─────────────────────────────────────────────────────────────────
+const TAG_LABELS = {
+  info: 'INFO', success: 'OK', warn: 'WARN', error: 'ERR',
+  transcript: 'TRANSCRIPT', action: 'ACTION',
+  confirm: 'CONFIRM', audio: 'AUDIO',
+};
+
+function log(type, message) {
+  const ts   = new Date().toISOString().slice(11, 23);
+  const tag  = TAG_LABELS[type] || type.toUpperCase();
+  const entry = document.createElement('div');
+  entry.className = `log-entry log-${type}`;
+  entry.innerHTML =
+    `<span class="log-ts">${ts}</span> ` +
+    `<span class="log-tag">${tag}</span> ` +
+    `<span class="log-body">${escHtml(String(message))}</span>`;
+  elLog.appendChild(entry);
+  elLog.scrollTop = elLog.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Status
+// ─────────────────────────────────────────────────────────────────
+function setStatus(state) {
+  // state: 'disconnected' | 'connecting' | 'connected'
+  elStatusDot.className = `dot ${state}`;
+  elStatusLabel.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 1. Start Session (calls POST /session/start)
+// ─────────────────────────────────────────────────────────────────
+btnStartSession.addEventListener('click', async () => {
+  const serverUrl = elServerUrl.value.trim().replace(/\/$/, '');
+  const mode      = elMode.value;
+  const repoId    = elRepoId.value.trim();
+
+  log('info', `POST ${serverUrl}/session/start  mode=${mode} repo_id=${repoId}`);
+
+  try {
+    const resp = await fetch(`${serverUrl}/session/start`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ mode, repo_id: repoId }),
+    });
+
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const detail = data?.detail || resp.statusText;
+      log('error', `Session start failed (HTTP ${resp.status}): ${detail}`);
+      return;
+    }
+
+    sessionId    = data.session_id;
+    sessionToken = data.token;
+
+    elSessionIdInput.value = sessionId;
+    elTokenInput.value     = sessionToken;
+    elPillSessionId.textContent = sessionId;
+    elPillToken.textContent = sessionToken.slice(0, 12) + '…';
+    elSessionPills.style.display = 'flex';
+
+    log('success', `Session created: ${sessionId}  mode=${data.mode}  repo=${data.repo_id}`);
+  } catch (e) {
+    log('error', `Fetch error: ${e.message}`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 2. WebSocket connect / disconnect
+// ─────────────────────────────────────────────────────────────────
+btnConnect.addEventListener('click', () => {
+  // Accept manually entered credentials too
+  if (!sessionToken) sessionToken = elTokenInput.value.trim();
+  if (!sessionId)    sessionId    = elSessionIdInput.value.trim();
+
+  if (!sessionToken) {
+    log('warn', 'No token — start a session first or paste credentials');
+    return;
+  }
+
+  const serverUrl = elServerUrl.value.trim().replace(/\/$/, '');
+  // Pass token as query param (see notice at top of page for required server change)
+  const wsUrl = serverUrl.replace(/^http/, 'ws')
+    + '/ws/voice?token=' + encodeURIComponent(sessionToken);
+
+  log('info', `Connecting → ${wsUrl}`);
+  setStatus('connecting');
+
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('connected');
+    btnConnect.disabled    = true;
+    btnDisconnect.disabled = false;
+    btnRecord.disabled     = false;
+    log('success', 'WebSocket connected');
+  };
+
+  ws.onclose = (e) => {
+    setStatus('disconnected');
+    btnConnect.disabled    = false;
+    btnDisconnect.disabled = true;
+    btnRecord.disabled     = true;
+    stopRecording(/* sendEOU= */ false);
+    log('info', `WebSocket closed  code=${e.code}  reason="${e.reason || 'none'}"`);
+    ws = null;
+  };
+
+  ws.onerror = () => {
+    log('error', 'WebSocket error — check server is running and token is valid');
+  };
+
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') handleFrame(e.data);
+  };
+});
+
+btnDisconnect.addEventListener('click', () => {
+  if (ws) ws.close(1000, 'user disconnect');
+  stopRecording(/* sendEOU= */ false);
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 3. Incoming frame handler
+// ─────────────────────────────────────────────────────────────────
+function handleFrame(raw) {
+  let frame;
+  try {
+    frame = JSON.parse(raw);
+  } catch {
+    log('error', `Non-JSON frame: ${raw.slice(0, 120)}`);
+    return;
+  }
+
+  const type = frame.type;
+
+  if (type === 'transcript') {
+    const marker = frame.is_final ? '✓ FINAL' : '…partial';
+    log('transcript', `[${marker}] "${frame.text}"`);
+
+  } else if (type === 'action_update') {
+    log('action', `id=${frame.action_id}  status=${frame.status}  "${frame.description}"`);
+
+  } else if (type === 'confirmation_required') {
+    log('confirm', `action_id=${frame.action_id}  prompt="${frame.prompt}"`);
+
+  } else if (type === 'response_audio') {
+    if (chkAudioLog.checked) {
+      const chunkLen = frame.chunk ? frame.chunk.length : 0;
+      log('audio', `is_final=${frame.is_final}  chunk_b64_len=${chunkLen}` +
+          (frame.highlighted_nodes?.length ? `  nodes=${frame.highlighted_nodes.join(',')}` : ''));
+    }
+    if (frame.chunk) playPCMChunk(frame.chunk);
+
+  } else if (type === 'error') {
+    log('error', `${frame.code}: ${frame.message}`);
+
+  } else {
+    log('info', JSON.stringify(frame));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 4. Audio recording (16kHz mono PCM via ScriptProcessorNode)
+// ─────────────────────────────────────────────────────────────────
+async function startRecording() {
+  if (recording) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log('warn', 'WebSocket not connected — cannot record');
+    return;
+  }
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount:     1,
+        sampleRate:       SAMPLE_RATE,
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
+    });
+
+    // AudioContext at 16kHz so no manual resampling needed in most browsers
+    audioCtxIn = new AudioContext({ sampleRate: SAMPLE_RATE });
+
+    const source = audioCtxIn.createMediaStreamSource(micStream);
+
+    // ScriptProcessorNode is deprecated but universally supported and
+    // simpler than AudioWorklet for a dev testing tool.
+    scriptProc = audioCtxIn.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+    scriptProc.onaudioprocess = (e) => {
+      if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      ws.send(float32ToPCM16(float32));
+    };
+
+    source.connect(scriptProc);
+    // Must connect to destination or onaudioprocess won't fire in some browsers
+    scriptProc.connect(audioCtxIn.destination);
+
+    recording = true;
+    btnRecord.classList.add('recording');
+    btnRecord.textContent = '⏹ Recording… (release to stop)';
+    document.getElementById('recording-banner').classList.add('active');
+    document.body.classList.add('is-recording');
+    log('info', `Recording started  sample_rate=${audioCtxIn.sampleRate}Hz`);
+
+  } catch (e) {
+    log('error', `Microphone error: ${e.name} — ${e.message}`);
+  }
+}
+
+function stopRecording(sendEOU = true) {
+  if (!recording) return;
+  recording = false;
+
+  // Empty binary frame = end-of-utterance signal (API spec)
+  if (sendEOU && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(new ArrayBuffer(0));
+    log('info', 'End-of-utterance frame sent');
+  }
+
+  if (scriptProc) { scriptProc.disconnect(); scriptProc = null; }
+  if (micStream)  { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioCtxIn) { audioCtxIn.close(); audioCtxIn = null; }
+
+  btnRecord.classList.remove('recording');
+  btnRecord.textContent = '🎙 Hold to Talk';
+  document.getElementById('recording-banner').classList.remove('active');
+  document.body.classList.remove('is-recording');
+  log('info', 'Recording stopped');
+}
+
+// Hold-to-talk bindings
+btnRecord.addEventListener('mousedown',  () => startRecording());
+btnRecord.addEventListener('mouseup',    () => stopRecording());
+btnRecord.addEventListener('mouseleave', () => { if (recording) stopRecording(); });
+btnRecord.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+btnRecord.addEventListener('touchend',   (e) => { e.preventDefault(); stopRecording(); });
+
+// ─────────────────────────────────────────────────────────────────
+// PCM helpers
+// ─────────────────────────────────────────────────────────────────
+function float32ToPCM16(float32) {
+  // Convert Float32 [-1,+1] → Int16 [-32768,+32767], return raw ArrayBuffer
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return int16.buffer;
+}
+
+function base64ToArrayBuffer(b64) {
+  const bin  = atob(b64);
+  const buf  = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 5. PCM playback (gapless scheduling via Web Audio API)
+// ─────────────────────────────────────────────────────────────────
+function getPlaybackCtx() {
+  if (!playbackCtx || playbackCtx.state === 'closed') {
+    playbackCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    nextPlayTime = 0;
+  }
+  // Resume if suspended (browser autoplay policy)
+  if (playbackCtx.state === 'suspended') playbackCtx.resume();
+  return playbackCtx;
+}
+
+function playPCMChunk(base64) {
+  try {
+    const raw   = base64ToArrayBuffer(base64);
+    const int16 = new Int16Array(raw);
+    if (int16.length === 0) return;
+
+    // Int16 → Float32 for AudioBuffer
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768.0;
+    }
+
+    const ctx    = getPlaybackCtx();
+    const buf    = ctx.createBuffer(1, float32.length, SAMPLE_RATE);
+    buf.copyToChannel(float32, 0);
+
+    const src    = ctx.createBufferSource();
+    src.buffer   = buf;
+    src.connect(ctx.destination);
+
+    // Schedule gaplessly: start immediately if we've fallen behind
+    const startAt = Math.max(ctx.currentTime, nextPlayTime);
+    src.start(startAt);
+    nextPlayTime = startAt + buf.duration;
+
+  } catch (e) {
+    log('error', `Playback error: ${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Log controls
+// ─────────────────────────────────────────────────────────────────
+btnClear.addEventListener('click', () => { elLog.innerHTML = ''; });
+
+// ─────────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────────
+setStatus('disconnected');
+btnRecord.disabled     = true;
+btnDisconnect.disabled = true;
+log('info', 'Vega Voice Test Console ready');
+</script>
+</body>
+</html>

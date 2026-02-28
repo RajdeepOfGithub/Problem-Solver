@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /Users/rajdeeproy/UMBC/Sem4_UMBC/Vega/vega && python -c \"from voice.audio_stream import AudioStreamSession; print\\('import OK'\\)\" 2>&1)",
+      "Bash(python:*)",
+      "Bash(do grep:*)"
+    ]
+  }
+}
