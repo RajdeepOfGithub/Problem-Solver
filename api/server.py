@@ -402,7 +402,7 @@ async def _run_indexing_job(
     try:
         # Import Phase 2 ingestion components
         from ingestion.repo_loader import load_repo_to_dir
-        from ingestion.embeddings import EmbeddingsPipeline
+        from ingestion.embeddings import embed_chunks
         from ingestion.vector_store import VectorStore
 
         # Step 1: Clone and chunk — use load_repo_to_dir to persist for DocScanner
@@ -437,10 +437,9 @@ async def _run_indexing_job(
             return
 
         # Step 2: Generate embeddings
-        embeddings = EmbeddingsPipeline()
         embedded_chunks = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: embeddings.embed_chunks(chunks),
+            lambda: embed_chunks(chunks),
         )
         _indexing_jobs[job_id]["progress"] = 60
 
