@@ -346,7 +346,6 @@ async def _handle_control_message(
 async def start_repo_index(
     request: RepoIndexRequest,
     background_tasks: BackgroundTasks,
-    session_id: str = Depends(_require_auth),
 ):
     """
     Trigger GitHub repo ingestion — clone, chunk, embed, store in FAISS.
@@ -582,7 +581,7 @@ def _extract_mermaid_node_ids(mermaid_text: str) -> list[str]:
 
 
 @app.get("/repo/diagram/{job_id}/two-tone")
-async def get_two_tone_diagram(job_id: str, session_id: str = Depends(_require_auth)):
+async def get_two_tone_diagram(job_id: str):
     """
     Returns the two-tone Mermaid diagram with green/gray/dashed node classification.
     Requires indexing to be complete. DocScanner runs on demand using stored chunks.
@@ -674,7 +673,7 @@ async def get_two_tone_diagram(job_id: str, session_id: str = Depends(_require_a
 
 
 @app.get("/repo/status/{job_id}")
-async def get_repo_status(job_id: str, session_id: str = Depends(_require_auth)):
+async def get_repo_status(job_id: str):
     """Poll the progress of an ongoing indexing job."""
     if job_id not in _indexing_jobs:
         raise HTTPException(status_code=404, detail="job_id does not exist")
@@ -690,7 +689,7 @@ async def get_repo_status(job_id: str, session_id: str = Depends(_require_auth))
 
 
 @app.get("/repo/diagram/{job_id}")
-async def get_repo_diagram(job_id: str, session_id: str = Depends(_require_auth)):
+async def get_repo_diagram(job_id: str):
     """Retrieve the generated Mermaid diagram for a completed indexing job."""
     if job_id not in _indexing_jobs:
         raise HTTPException(status_code=404, detail="job_id not found")
@@ -767,7 +766,6 @@ async def start_session(request: SessionStartRequest):
 @app.post("/session/optimize")
 async def trigger_optimization(
     request: OptimizeRequest,
-    session_id: str = Depends(_require_auth),
 ):
     """
     Trigger the Project Intelligence Agent for the current session.
