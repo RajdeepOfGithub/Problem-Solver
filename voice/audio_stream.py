@@ -113,6 +113,8 @@ class StreamCallbacks:
     on_error: Callable            # {"type": "error", "code": ..., "message": ...}
     # Phase 5: mode switch notification
     on_mode_switch: Optional[Callable] = None  # {"type": "mode_switch", "from": ..., "to": ...}
+    # Mode change: emitted immediately on intent classification (before agent pipeline)
+    on_mode_change: Optional[Callable] = None  # {"type": "mode_change", "intent": ..., "mode_family": ...}
 
 
 # ─────────────────────────────────────────────
@@ -324,6 +326,19 @@ class AudioStreamSession:
                 voice_response = result.get("voice_response", "")
                 actions_proposed = result.get("actions_proposed", [])
                 requires_confirmation = result.get("requires_confirmation", False)
+
+                # Emit mode_change frame immediately — UI updates badge before agent results arrive
+                intent = result.get("intent", "dev_explore")
+                mode_family = "ops" if intent.startswith("ops_") else "dev"
+                if self.callbacks.on_mode_change:
+                    try:
+                        await self.callbacks.on_mode_change({
+                            "type":        "mode_change",
+                            "intent":      intent,
+                            "mode_family": mode_family,
+                        })
+                    except Exception as exc:
+                        logger.error(f"[{self.session_id}] on_mode_change error: {exc}")
 
                 # Phase 5: emit mode_switch frame if orchestrator triggered a mode change
                 mode_switch = result.get("mode_switch")

@@ -278,6 +278,16 @@ async def websocket_voice(websocket: WebSocket):
         except Exception as e:
             logger.error(f"on_mode_switch send error: {e}")
 
+    async def on_mode_change(frame: dict):
+        try:
+            await websocket.send_json(frame)
+            logger.debug(
+                f"mode_change emitted: intent={frame.get('intent')} "
+                f"family={frame.get('mode_family')} (session {session_id})"
+            )
+        except Exception as e:
+            logger.error(f"on_mode_change send error: {e}")
+
     callbacks = StreamCallbacks(
         on_transcript=on_transcript,
         on_action_update=on_action_update,
@@ -285,6 +295,7 @@ async def websocket_voice(websocket: WebSocket):
         on_confirmation_required=on_confirmation_required,
         on_error=on_error,
         on_mode_switch=on_mode_switch,
+        on_mode_change=on_mode_change,
     )
 
     # ── Create audio session ──────────────────────────────────────────────────

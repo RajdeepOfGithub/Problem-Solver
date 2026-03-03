@@ -492,6 +492,7 @@ class OrchestratorAgent:
                     "actions_proposed": [],
                     "requires_confirmation": False,
                     "mode_switch": None,
+                    "intent": "ambiguous",
                 }
             else:
                 result = self.dispatch_to_agents(
@@ -505,6 +506,9 @@ class OrchestratorAgent:
                 # Propagate mode_switch into the result for server.py to emit
                 if mode_switch and "mode_switch" not in result:
                     result["mode_switch"] = mode_switch
+
+            # Always surface the classified intent so audio_stream can emit mode_change
+            result["intent"] = classification["intent"]
 
             # Append turn to memory and trim to rolling 10-entry window
             memory.append({"role": "user",  "content": voice_text})

@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import VegaDiagram from "./components/VegaDiagram";
+import ModeIndicator from "./components/ModeIndicator";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const API = "http://localhost:8000";
@@ -302,6 +303,16 @@ const css = `
 
   .repo-url-short { font-family: var(--mono); font-size: 11px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 
+  @keyframes modeTransitionFlash {
+    0%   { opacity: 0; }
+    20%  { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  .mode-transition-flash {
+    animation: modeTransitionFlash 600ms ease forwards;
+    background: linear-gradient(90deg, rgba(99,102,241,0.12) 0%, rgba(220,38,38,0.12) 100%);
+  }
+
 `;
 
 // ── Action icon helper ────────────────────────────────────────────────────
@@ -349,6 +360,9 @@ export default function VegaUI() {
   const [isIndexing, setIsIndexing] = useState(false);
   const [intelCards, setIntelCards] = useState([]);
   const [highlightedNodes, setHighlightedNodes] = useState([]);
+  const [currentMode, setCurrentMode] = useState("dev_explore");
+  const [modeFamily, setModeFamily] = useState("dev");
+  const [isTransitioning, setIsTransitioning] = useState(false);
 
   // Refs
   const wsRef = useRef(null);
@@ -357,6 +371,8 @@ export default function VegaUI() {
   const pollRef = useRef(null);
   const transcriptEndRef = useRef(null);
   const waveAnim = useRef(null);
+  const modeFamilyRef = useRef("dev");
+  const transitionTimeoutRef = useRef(null);
 
   // Scroll transcript to bottom
   useEffect(() => { transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, partialTranscript]);
@@ -460,6 +476,11 @@ export default function VegaUI() {
         setMessages([]);
         setActions([]);
         setScreen("session");
+        // Reset mode indicator to dev_explore at session start
+        setCurrentMode("dev_explore");
+        setModeFamily("dev");
+        setIsTransitioning(false);
+        modeFamilyRef.current = "dev";
         setRecentSessions(prev => [{ id: d.session_id, mode: m, time: new Date().toISOString() }, ...prev.slice(0, 9)]);
         connectWS(d.session_id, d.session_token || "demo-token");
       }
@@ -526,6 +547,21 @@ export default function VegaUI() {
       case "confirmation_required":
         setConfirmation({ action_id: frame.action_id, prompt: frame.prompt });
         break;
+
+      case "mode_change": {
+        const newFamily = frame.mode_family;
+        const prevFamily = modeFamilyRef.current;
+        modeFamilyRef.current = newFamily;
+        setCurrentMode(frame.intent);
+        setModeFamily(newFamily);
+        // Trigger transition flash on dev→ops crossover
+        if (prevFamily === "dev" && newFamily === "ops") {
+          setIsTransitioning(true);
+          clearTimeout(transitionTimeoutRef.current);
+          transitionTimeoutRef.current = setTimeout(() => setIsTransitioning(false), 600);
+        }
+        break;
+      }
 
       case "error":
         console.error("[WS] error frame:", frame);
@@ -616,7 +652,7 @@ export default function VegaUI() {
   }, [screen, sessionId]);
 
   // Cleanup
-  useEffect(() => () => { clearInterval(pollRef.current); wsRef.current?.close(); stopMic(); stopWaveAnim(); }, []);
+  useEffect(() => () => { clearInterval(pollRef.current); wsRef.current?.close(); stopMic(); stopWaveAnim(); clearTimeout(transitionTimeoutRef.current); }, []);
 
   // ── Render helpers ────────────────────────────────────────────────────
   const healthDot = (key) => {
@@ -908,7 +944,16 @@ export default function VegaUI() {
   const SessionScreen = () => {
     const mc = MODE_CONFIG[mode];
     return (
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", position: "relative" }}>
+        {/* Dev→Ops transition flash overlay */}
+        <div
+          className={isTransitioning ? "mode-transition-flash" : ""}
+          style={{
+            position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5,
+            display: isTransitioning ? "block" : "none",
+          }}
+        />
+
         {/* mode banner */}
         <div className="mode-banner">
           <div className="mode-badge">
@@ -919,6 +964,14 @@ export default function VegaUI() {
             </div>
           </div>
           <div className="mode-toggle">
+            {/* Live mode indicator — only shown when session is active */}
+            {sessionId && (
+              <ModeIndicator
+                mode={currentMode}
+                modeFamily={modeFamily}
+                isTransitioning={isTransitioning}
+              />
+            )}
             <button className={`mode-btn ${mode === "dev" ? "active" : ""}`} onClick={() => { setMode("dev"); startSession("dev"); }}>Dev</button>
             <button className={`mode-btn ops ${mode === "ops" ? "active" : ""}`} onClick={() => { setMode("ops"); startSession("ops"); }}>Ops</button>
             <button onClick={() => { setScreen("ready"); wsRef.current?.close(); stopMic(); }} style={{ padding: "5px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "transparent", color: "var(--text2)", fontSize: 11, cursor: "pointer", fontFamily: "var(--sans)" }}>← Repo</button>
