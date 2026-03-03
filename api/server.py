@@ -148,7 +148,7 @@ def _require_auth(authorization: str = Header(None, alias="Authorization")) -> s
 class RepoIndexRequest(BaseModel):
     repo_url: str
     branch: str = "main"
-    github_token: str
+    github_token: str = ""
 
     @field_validator("repo_url")
     @classmethod
@@ -483,88 +483,179 @@ async def _generate_repo_diagram(
     file_count: int,
 ) -> dict:
     """
-    Generate a Mermaid diagram from the file tree and import graph.
-    Validates output server-side before returning — never sends invalid Mermaid to frontend.
-    Falls back to plain text if generation fails (Architecture spec §8).
+    Generate nodes/edges graph from the file tree and import graph.
+    Also produces Mermaid text (kept internally for two-tone endpoint compatibility).
     """
-    import boto3
+    import re
 
     # Determine diagram level (Architecture spec §8)
     diagram_level = "file" if file_count <= 30 else "folder"
 
-    try:
-        bedrock = boto3.client(
-            "bedrock-runtime",
-            region_name=os.getenv("AWS_BEDROCK_REGION", "us-east-1"),
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
+    def _sanitize(s: str) -> str:
+        """Replace any non-alphanumeric character with underscore."""
+        return re.sub(r"[^A-Za-z0-9]", "_", s).strip("_") or "node"
 
-        prompt = f"""Generate a valid Mermaid flowchart diagram for this repository structure.
+    def _file_type_info(path: str) -> tuple[str, str]:
+        """Returns (file_type, accent_color) for a file path."""
+        name = path.rsplit("/", 1)[-1].lower()
+        if name.endswith(".ipynb"):
+            return "notebook", "#0369a1"
+        if any(name.endswith(ext) for ext in (".h5", ".pkl", ".pt", ".pth", ".onnx")):
+            return "model", "#065f46"
+        if any(name.endswith(ext) for ext in (".json", ".csv", ".parquet", ".tsv")):
+            return "data", "#92400e"
+        if (any(name.endswith(ext) for ext in (".txt", ".md", ".rst", ".toml", ".yaml", ".yml"))
+                or "requirements" in name or name in ("makefile", "dockerfile")):
+            return "config", "#1e293b"
+        if name.endswith(".py"):
+            return "python", "#4338ca"
+        return "other", "#374151"
 
-Diagram level: {diagram_level}
-File tree:
-{chr(10).join(file_tree[:100])}
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    node_ids: list[str] = []
+    edge_counter = 0
+    lines: list[str] = []
 
-Import relationships (file → imports):
-{json.dumps(dict(list(import_graph.items())[:50]), indent=2)}
+    if diagram_level == "file":
+        # ── File-level: one node per file, folder --> file edges ───────────────
+        lines = ["flowchart TD"]
 
-Rules:
-1. Output ONLY valid Mermaid flowchart syntax. No markdown fences, no explanation.
-2. Start with: flowchart TD
-3. Node IDs must exactly match file paths (e.g., api/gateway.py) or folder names (e.g., api/)
-4. Use --> for import relationships
-5. Maximum 40 nodes for readability
-6. Group by directory using subgraph blocks
-7. No circular edges — if a circular import exists, add a note label to the edge
+        # Collect folders
+        folders: set[str] = set()
+        for path in file_tree[:40]:
+            parts = path.split("/")
+            if len(parts) > 1:
+                folders.add(parts[0])
 
-Output only the Mermaid diagram:"""
+        # Emit folder nodes
+        for folder in sorted(folders):
+            nid = _sanitize(folder)
+            lines.append(f'    {nid}["{folder}/"]')
+            node_ids.append(nid)
+            nodes.append({
+                "id": folder + "/",
+                "label": folder,
+                "file_type": "folder",
+                "node_type": "source",
+                "accent_color": "#374151",
+                "metadata": {"path": folder + "/", "imports": []},
+            })
 
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: bedrock.invoke_model(
-                modelId=os.getenv("NOVA_LITE_MODEL_ID", "amazon.nova-2-lite-v1:0"),
-                body=json.dumps({
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 2000,
-                }),
-                contentType="application/json",
-                accept="application/json",
-            ),
-        )
+        # Emit file nodes + folder --> file edges
+        for path in file_tree[:40]:
+            parts = path.split("/")
+            file_nid = _sanitize(path)
+            label = parts[-1]
+            file_type, accent_color = _file_type_info(path)
+            label_display = label.rsplit(".", 1)[0] if "." in label else label
+            lines.append(f'    {file_nid}["{label}"]')
+            node_ids.append(file_nid)
+            nodes.append({
+                "id": path,
+                "label": label_display,
+                "file_type": file_type,
+                "node_type": "source",
+                "accent_color": accent_color,
+                "metadata": {"path": path, "imports": import_graph.get(path, [])},
+            })
+            if len(parts) > 1:
+                folder_nid = _sanitize(parts[0])
+                lines.append(f"    {folder_nid} --> {file_nid}")
+                edge_counter += 1
+                edges.append({
+                    "id": f"e{edge_counter}",
+                    "source": parts[0] + "/",
+                    "target": path,
+                    "label": "contains",
+                })
 
-        response_body = json.loads(response["body"].read())
-        mermaid_text = (
-            response_body.get("content", [{}])[0].get("text", "").strip()
-        )
+        # Add import edges (skip circular / unknown)
+        seen_edges: set[tuple[str, str]] = set()
+        for src, targets in list(import_graph.items())[:30]:
+            src_nid = _sanitize(src)
+            if src_nid not in node_ids:
+                continue
+            for tgt in targets[:5]:
+                tgt_nid = _sanitize(tgt)
+                if tgt_nid not in node_ids:
+                    continue
+                edge = (src_nid, tgt_nid)
+                if edge in seen_edges or src_nid == tgt_nid:
+                    continue
+                seen_edges.add(edge)
+                lines.append(f"    {src_nid} -.-> {tgt_nid}")
+                edge_counter += 1
+                edges.append({
+                    "id": f"e{edge_counter}",
+                    "source": src,
+                    "target": tgt,
+                    "label": "imports",
+                })
 
-        # Server-side validation: must start with flowchart
-        if not mermaid_text.startswith("flowchart"):
-            raise ValueError("Invalid Mermaid output — does not start with 'flowchart'")
+    else:
+        # ── Folder-level: one node per top-level folder ────────────────────────
+        lines = ["flowchart TD"]
 
-        # Extract node IDs from the diagram
-        node_ids = _extract_mermaid_node_ids(mermaid_text)
+        folder_files: dict[str, list[str]] = {}
+        for path in file_tree[:100]:
+            parts = path.split("/")
+            top = parts[0] if len(parts) > 1 else "__root__"
+            folder_files.setdefault(top, []).append(path)
 
-        return {
-            "mermaid": mermaid_text,
-            "node_ids": node_ids,
-            "diagram_level": diagram_level,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        for folder, files in sorted(folder_files.items()):
+            nid = _sanitize(folder)
+            label = folder if folder != "__root__" else "(root)"
+            count = len(files)
+            lines.append(f'    {nid}["{label} ({count} files)"]')
+            node_ids.append(nid)
+            nodes.append({
+                "id": folder,
+                "label": label,
+                "file_type": "folder",
+                "node_type": "source",
+                "accent_color": "#374151",
+                "metadata": {"path": folder, "file_count": count, "imports": []},
+            })
 
-    except Exception as e:
-        logger.warning(f"Mermaid generation failed for {job_id}: {e} — using text fallback")
-        # Fallback: plain text file tree (Architecture spec §8)
-        fallback = "flowchart TD\n"
-        for i, path in enumerate(file_tree[:30]):
-            safe_id = path.replace("/", "_").replace(".", "_").replace("-", "_")
-            fallback += f'    {safe_id}["{path}"]\n'
-        return {
-            "mermaid": fallback,
-            "node_ids": [f.replace("/", "_").replace(".", "_") for f in file_tree[:30]],
-            "diagram_level": diagram_level,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        # Cross-folder import edges
+        def _top_folder(p: str) -> str:
+            parts = p.split("/")
+            return parts[0] if len(parts) > 1 else "__root__"
+
+        seen_edges = set()
+        for src, targets in list(import_graph.items())[:50]:
+            src_folder = _top_folder(src)
+            src_nid = _sanitize(src_folder)
+            if src_nid not in node_ids:
+                continue
+            for tgt in targets[:5]:
+                tgt_folder = _top_folder(tgt)
+                tgt_nid = _sanitize(tgt_folder)
+                if tgt_nid not in node_ids or tgt_folder == src_folder:
+                    continue
+                edge = (src_folder, tgt_folder)
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+                lines.append(f"    {src_folder} --> {tgt_folder}")
+                edge_counter += 1
+                edges.append({
+                    "id": f"e{edge_counter}",
+                    "source": src_folder,
+                    "target": tgt_folder,
+                    "label": "imports",
+                })
+
+    mermaid_text = "\n".join(lines)
+    return {
+        "mermaid": mermaid_text,   # kept for two-tone endpoint
+        "node_ids": node_ids,      # kept for two-tone endpoint
+        "nodes": nodes,
+        "edges": edges,
+        "diagram_level": diagram_level,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _extract_mermaid_node_ids(mermaid_text: str) -> list[str]:
@@ -689,7 +780,7 @@ async def get_repo_status(job_id: str):
 
 @app.get("/repo/diagram/{job_id}")
 async def get_repo_diagram(job_id: str):
-    """Retrieve the generated Mermaid diagram for a completed indexing job."""
+    """Retrieve the generated SVG node/edge diagram for a completed indexing job."""
     if job_id not in _indexing_jobs:
         raise HTTPException(status_code=404, detail="job_id not found")
 
@@ -701,15 +792,15 @@ async def get_repo_diagram(job_id: str):
     if job.get("file_count", 0) > 100:
         raise HTTPException(status_code=422, detail="Repo exceeded 100 file limit")
 
-    if not job.get("mermaid"):
-        raise HTTPException(status_code=500, detail="Mermaid generation failed")
+    if not job.get("nodes"):
+        raise HTTPException(status_code=500, detail="Diagram generation failed")
 
     return {
         "job_id": job_id,
         "diagram_level": job["diagram_level"],
         "file_count": job["file_count"],
-        "mermaid": job["mermaid"],
-        "node_ids": job["node_ids"],
+        "nodes": job["nodes"],
+        "edges": job["edges"],
         "generated_at": job["generated_at"],
     }
 
@@ -1044,8 +1135,17 @@ if __name__ == "__main__":
 _indexing_jobs["test_job"] = {
     "status": "complete", "file_count": 5,
     "mermaid": "flowchart TD\n A --> B", "node_ids": [],
-    "diagram_level": "file", "generated_at": "", 
-    "chunks_indexed": 0, "total_chunks": 0
+    "nodes": [
+        {"id": "app.py", "label": "app", "file_type": "python", "node_type": "source",
+         "accent_color": "#4338ca", "metadata": {"path": "app.py", "imports": ["utils.py"]}},
+        {"id": "utils.py", "label": "utils", "file_type": "python", "node_type": "source",
+         "accent_color": "#4338ca", "metadata": {"path": "utils.py", "imports": []}},
+    ],
+    "edges": [
+        {"id": "e1", "source": "app.py", "target": "utils.py", "label": "imports"},
+    ],
+    "diagram_level": "file", "generated_at": "",
+    "chunks_indexed": 0, "total_chunks": 0,
 }
 
 
