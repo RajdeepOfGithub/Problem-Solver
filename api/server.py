@@ -513,14 +513,16 @@ async def _generate_repo_diagram(
             return "notebook", "#0369a1"
         if any(name.endswith(ext) for ext in (".h5", ".pkl", ".pt", ".pth", ".onnx")):
             return "model", "#065f46"
-        if any(name.endswith(ext) for ext in (".json", ".csv", ".parquet", ".tsv")):
+        if any(name.endswith(ext) for ext in (".json", ".csv", ".parquet", ".tsv", ".npy")):
             return "data", "#92400e"
-        if (any(name.endswith(ext) for ext in (".txt", ".md", ".rst", ".toml", ".yaml", ".yml"))
+        if (any(name.endswith(ext) for ext in (".txt", ".md", ".rst", ".toml", ".yaml", ".yml", ".cfg"))
                 or "requirements" in name or name in ("makefile", "dockerfile")):
             return "config", "#1e293b"
         if name.endswith(".py"):
             return "python", "#4338ca"
-        return "other", "#374151"
+        if any(name.endswith(ext) for ext in (".js", ".ts", ".jsx", ".tsx")):
+            return "javascript", "#b45309"
+        return "file", "#334155"  # catch-all: slate
 
     nodes: list[dict] = []
     edges: list[dict] = []

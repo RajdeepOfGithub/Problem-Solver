@@ -363,6 +363,7 @@ export default function VegaUI() {
   const [currentMode, setCurrentMode] = useState("dev_explore");
   const [modeFamily, setModeFamily] = useState("dev");
   const [isTransitioning, setIsTransitioning] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
 
   // Refs
   const wsRef = useRef(null);
@@ -539,8 +540,12 @@ export default function VegaUI() {
         if (frame.highlighted_nodes?.length) setHighlightedNodes(frame.highlighted_nodes);
         if (frame.chunk && audioCtxRef.current) playBase64Audio(frame.chunk, audioCtxRef.current);
         if (frame.is_final) {
+          setIsRecording(false);
           setMicState("idle");
           setActiveAgents([]);
+          if (frame.text) {
+            setMessages(prev => [...prev, { role: "vega", content: frame.text, ts: new Date().toISOString() }]);
+          }
         }
         break;
 
@@ -572,21 +577,24 @@ export default function VegaUI() {
   }
 
   // ── Mic ───────────────────────────────────────────────────────────────
-  async function toggleMic() {
-    if (micState === "listening") {
+  async function toggleRecording() {
+    if (isRecording) {
+      // STOP path
       stopMic();
-      // send end-of-utterance
       if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(new ArrayBuffer(0));
+      setIsRecording(false);
       setMicState("processing");
       stopWaveAnim();
       return;
     }
+    // START path
     if (micState !== "idle") return;
     try {
       if (!audioCtxRef.current) audioCtxRef.current = new AudioContext();
       micRef.current = await startMicCapture((chunk) => {
         if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(chunk);
       });
+      setIsRecording(true);
       setMicState("listening");
       startWaveAnim();
     } catch (e) {
@@ -954,6 +962,17 @@ export default function VegaUI() {
           }}
         />
 
+        {/* ModeIndicator — absolute top-right, read-only reactive badge */}
+        {sessionId && (
+          <div style={{ position: "absolute", top: 16, right: 16, zIndex: 10 }}>
+            <ModeIndicator
+              mode={currentMode}
+              modeFamily={modeFamily}
+              isTransitioning={isTransitioning}
+            />
+          </div>
+        )}
+
         {/* mode banner */}
         <div className="mode-banner">
           <div className="mode-badge">
@@ -964,16 +983,6 @@ export default function VegaUI() {
             </div>
           </div>
           <div className="mode-toggle">
-            {/* Live mode indicator — only shown when session is active */}
-            {sessionId && (
-              <ModeIndicator
-                mode={currentMode}
-                modeFamily={modeFamily}
-                isTransitioning={isTransitioning}
-              />
-            )}
-            <button className={`mode-btn ${mode === "dev" ? "active" : ""}`} onClick={() => { setMode("dev"); startSession("dev"); }}>Dev</button>
-            <button className={`mode-btn ops ${mode === "ops" ? "active" : ""}`} onClick={() => { setMode("ops"); startSession("ops"); }}>Ops</button>
             <button onClick={() => { setScreen("ready"); wsRef.current?.close(); stopMic(); }} style={{ padding: "5px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "transparent", color: "var(--text2)", fontSize: 11, cursor: "pointer", fontFamily: "var(--sans)" }}>← Repo</button>
           </div>
         </div>
@@ -1030,7 +1039,7 @@ export default function VegaUI() {
         <div className="mic-area">
           <button
             className={`mic-btn ${micState}`}
-            onClick={toggleMic}
+            onClick={toggleRecording}
             title={micState === "idle" ? "Click to speak" : micState === "listening" ? "Click to stop" : "Processing…"}
           >
             {micState === "idle" ? "🎙" : micState === "listening" ? "⏹" : <div className="spinner" style={{ width: 20, height: 20 }} />}
@@ -1093,10 +1102,10 @@ export default function VegaUI() {
   // ── Space to toggle mic ─────────────────────────────────────────────────
   useEffect(() => {
     if (screen !== "session") return;
-    const handler = (e) => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); toggleMic(); } };
+    const handler = (e) => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); toggleRecording(); } };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [screen, micState]);
+  }, [screen, isRecording, micState]);
 
   // ── Render ─────────────────────────────────────────────────────────────
   return (
