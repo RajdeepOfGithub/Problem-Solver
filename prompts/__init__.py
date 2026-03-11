@@ -1,0 +1,1 @@
+# Vega prompt templates package

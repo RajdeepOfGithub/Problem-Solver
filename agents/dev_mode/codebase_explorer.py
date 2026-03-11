@@ -1,98 +1,242 @@
-# codebase_explorer.py
-# Phase 5 — Codebase Explorer Agent
-# Model:   Nova 2 Lite via Bedrock
-# Prompt:  prompts/dev_mode/codebase_explorer.txt
-#
-# Role (per AGENTS.md):
-#   Guides developers through unfamiliar codebases via voice. Explains how
-#   files and folders connect and traces specific flows (auth, payments, etc.).
-#   Runs automatically after indexing completes to produce a default "repo
-#   overview" walkthrough, and responds to on-demand flow questions.
-#
-# Output structure (per AGENTS.md / PROMPTS_GUIDE.md):
-#   {
-#     "status": "ok | repo_too_large | insufficient_context",
-#     "repo_summary": str,        # one-sentence repo description
-#     "diagram_level": str,       # "file" | "folder"
-#     "walkthrough": [
-#       {
-#         "sentence": str,             # max 20 words, declarative, voice-ready
-#         "highlighted_nodes": list[str]  # IDs from diagram_node_ids only
-#       },
-#       ...                            # max 8 sentences (overview), 6 (flow)
-#     ]
-#   }
-#
-# Key constraints (per AGENTS.md):
-#   - Only operates on repos with ≤ 100 indexed files; returns repo_too_large otherwise
-#   - highlighted_nodes must only contain IDs present in diagram_node_ids
-#   - On session start, runs automatically for "overview" without user asking
-#   - Diagram level (file vs folder) drives which node IDs are valid
+"""
+agents/dev_mode/codebase_explorer.py
+Vega — Codebase Explorer Agent
+
+Guides developers through an unfamiliar codebase via voice. Produces an
+ordered, sentence-by-sentence walkthrough paired with diagram node IDs for
+real-time highlighting. Runs automatically on session start for repo overview,
+and on-demand for specific flow questions.
+
+Model:  Amazon Nova 2 Lite via Bedrock converse API
+Prompt: prompts/dev_mode/codebase_explorer.txt
+"""
 
 from __future__ import annotations
 
-# Placeholder import — VectorStore will be wired in during Phase 5 implementation
-# from ingestion.vector_store import VectorStore  # noqa: F401
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List
+
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+NOVA_LITE_MODEL_ID: str = os.getenv("NOVA_LITE_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
+AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+
+_PROMPT_PATH: Path = (
+    Path(__file__).parent.parent.parent / "prompts" / "dev_mode" / "codebase_explorer.txt"
+)
+
+_MAX_FILES = 100
+_MAX_OVERVIEW_SENTENCES = 8
+_MAX_FLOW_SENTENCES = 6
 
 
 class CodebaseExplorerAgent:
     """
     Guides developers through an unfamiliar codebase via voice.
 
-    Produces an ordered, sentence-by-sentence walkthrough of either the full
-    repository (when voice_query is "overview") or a specific code flow
-    (e.g. "walk me through the auth flow"). Each sentence in the walkthrough
-    is paired with a list of diagram node IDs (highlighted_nodes) that the
-    frontend highlights in the Mermaid diagram in real time as Nova Sonic
-    speaks the sentence.
+    Produces an ordered walkthrough where each sentence is paired with
+    diagram node IDs to highlight in real time as Nova Sonic speaks.
 
-    The audio stream's is_final flag is the master clock — the diagram never
-    advances to the next highlighted_nodes set until is_final: true is received
-    for the current sentence's audio chunk.
+    Usage::
 
-    Scope constraint (per ARCHITECTURE.md):
-        Repos with more than 100 indexed files are rejected. The agent returns
-        {"status": "repo_too_large", "message": "..."} and the Orchestrator
-        surfaces this to the user by voice.
-
-    Diagram level awareness:
-        The agent receives diagram_level ("file" | "folder") and
-        diagram_node_ids (the complete list of valid node IDs in the current
-        diagram). It must only reference IDs from diagram_node_ids in
-        highlighted_nodes — never fabricate or guess a node ID.
-
-    System prompt:
-        prompts/dev_mode/codebase_explorer.txt — version-controlled as core IP.
+        agent = CodebaseExplorerAgent()
+        result = await agent.analyze(
+            voice_query="overview",
+            file_tree=["api/server.py", ...],
+            import_graph={"api/server.py": ["agents/orchestrator.py"]},
+            code_chunks=[...],
+            diagram_level="file",
+            diagram_node_ids=["api_server_py", "agents_orchestrator_py"],
+        )
     """
 
-    def run(self, context: dict) -> dict:
-        """
-        Execute the Codebase Explorer Agent for a single turn.
+    def __init__(self) -> None:
+        self._bedrock = boto3.client(
+            "bedrock-runtime",
+            region_name=AWS_REGION,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        )
+        self._system_prompt: str = self._load_system_prompt()
 
-        Expected context keys (per AGENTS.md / codebase_explorer.txt):
-            voice_query (str):          Developer's voice question, or "overview"
-                                        for the automatic session-start walkthrough.
-            file_tree (list[str]):      Complete list of all files/folders in the repo.
-            import_graph (dict):        {file_path: [imported_file_paths]} from
-                                        ingestion.repo_loader.build_import_graph().
-            code_chunks (list[dict]):   FAISS-retrieved chunks relevant to voice_query.
-            diagram_level (str):        "file" or "folder" — level of the current diagram.
-            diagram_node_ids (list[str]): All valid node IDs in the current Mermaid diagram.
+    async def analyze(
+        self,
+        voice_query: str,
+        file_tree: List[str],
+        import_graph: Dict[str, List[str]],
+        code_chunks: List[Dict],
+        diagram_level: str = "file",
+        diagram_node_ids: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Produce a voice walkthrough of the codebase or a specific flow.
+
+        Args:
+            voice_query:      "overview" for auto session-start, or a specific question.
+            file_tree:        Complete list of all files/folders in the repo.
+            import_graph:     {file_path: [imported_file_paths]} mapping.
+            code_chunks:      FAISS-retrieved chunks relevant to the query.
+            diagram_level:    "file" or "folder".
+            diagram_node_ids: All valid node IDs in the current diagram.
 
         Returns:
-            {
-                "status": "ok | repo_too_large | insufficient_context",
-                "repo_summary": str,
-                "diagram_level": str,
-                "walkthrough": [
-                    {"sentence": str, "highlighted_nodes": list[str]},
-                    ...
-                ]
+            Dict matching codebase_explorer.txt output schema:
+            {status, repo_summary, diagram_level, walkthrough}
+        """
+        diagram_node_ids = diagram_node_ids or []
+
+        # Scope constraint: repos over 100 files are rejected
+        if len(file_tree) > _MAX_FILES:
+            return {
+                "status": "repo_too_large",
+                "repo_summary": "",
+                "diagram_level": diagram_level,
+                "walkthrough": [],
             }
 
-        Raises:
-            NotImplementedError: Always — implementation deferred to Phase 5.
-        """
-        raise NotImplementedError(
-            "Codebase Explorer Agent — implementation in Phase 5"
+        prompt = self._build_prompt(
+            voice_query, file_tree, import_graph, code_chunks,
+            diagram_level, diagram_node_ids,
         )
+
+        try:
+            response = await asyncio.to_thread(
+                self._bedrock.converse,
+                modelId=NOVA_LITE_MODEL_ID,
+                system=[{"text": self._system_prompt}],
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+            )
+            raw: str = response["output"]["message"]["content"][0]["text"].strip()
+            raw = self._strip_fences(raw)
+            result: Dict[str, Any] = json.loads(raw)
+
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            logger.error("CodebaseExplorerAgent: Bedrock error (%s): %s", code, exc)
+            return self._error_response(diagram_level)
+        except json.JSONDecodeError as exc:
+            logger.error("CodebaseExplorerAgent: JSON parse error: %s", exc)
+            return self._error_response(diagram_level)
+        except Exception as exc:
+            logger.error("CodebaseExplorerAgent: unexpected error: %s", exc)
+            return self._error_response(diagram_level)
+
+        # Post-process: enforce node ID validity and sentence limits
+        result = self._validate_output(result, diagram_node_ids, voice_query, diagram_level)
+
+        logger.info(
+            "CodebaseExplorerAgent: walkthrough generated — %d sentences, level=%s",
+            len(result.get("walkthrough", [])),
+            result.get("diagram_level", diagram_level),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_prompt(
+        self,
+        voice_query: str,
+        file_tree: List[str],
+        import_graph: Dict[str, List[str]],
+        code_chunks: List[Dict],
+        diagram_level: str,
+        diagram_node_ids: List[str],
+    ) -> str:
+        parts: List[str] = [
+            f"VOICE QUERY: {voice_query}",
+            f"\nDIAGRAM LEVEL: {diagram_level}",
+            f"\nDIAGRAM NODE IDS (only use these in highlighted_nodes):\n{json.dumps(diagram_node_ids)}",
+            f"\nFILE TREE ({len(file_tree)} files):",
+        ]
+        for f in file_tree[:80]:
+            parts.append(f"  {f}")
+
+        if import_graph:
+            parts.append("\nIMPORT GRAPH (file → imports):")
+            for src, targets in list(import_graph.items())[:40]:
+                if targets:
+                    parts.append(f"  {src} → {', '.join(targets[:5])}")
+        else:
+            # For repos with no import edges (e.g. notebook/binary repos like Sentinel),
+            # Nova Lite should infer workflow order from README content in code_chunks.
+            parts.append("\nIMPORT GRAPH: No import edges detected. Infer workflow order from README and file naming conventions.")
+
+        if code_chunks:
+            parts.append("\nCODE CHUNKS (relevant context):")
+            for chunk in code_chunks[:8]:
+                parts.append(
+                    f"\n--- {chunk.get('file', 'unknown')} "
+                    f"(lines {chunk.get('start_line', '?')}-{chunk.get('end_line', '?')}) ---"
+                )
+                parts.append(chunk.get("content", "")[:1500])
+
+        return "\n".join(parts)
+
+    def _validate_output(
+        self,
+        result: Dict[str, Any],
+        diagram_node_ids: List[str],
+        voice_query: str,
+        diagram_level: str,
+    ) -> Dict[str, Any]:
+        """Post-process: strip invalid node IDs, enforce sentence limits."""
+        valid_ids = set(diagram_node_ids)
+        walkthrough = result.get("walkthrough", [])
+
+        # Filter highlighted_nodes to only valid IDs
+        for step in walkthrough:
+            nodes = step.get("highlighted_nodes", [])
+            step["highlighted_nodes"] = [n for n in nodes if n in valid_ids]
+
+        # Enforce sentence count limits
+        is_overview = voice_query.strip().lower() == "overview"
+        max_sentences = _MAX_OVERVIEW_SENTENCES if is_overview else _MAX_FLOW_SENTENCES
+        result["walkthrough"] = walkthrough[:max_sentences]
+
+        # Ensure diagram_level is preserved
+        result["diagram_level"] = result.get("diagram_level", diagram_level)
+
+        return result
+
+    def _load_system_prompt(self) -> str:
+        try:
+            return _PROMPT_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.warning("codebase_explorer.txt not found — using inline default")
+            return (
+                "You are Vega's Codebase Explorer Agent. Produce a voice walkthrough "
+                "of the codebase. Return valid JSON only matching the required schema."
+            )
+
+    @staticmethod
+    def _strip_fences(text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        return text.strip()
+
+    @staticmethod
+    def _error_response(diagram_level: str) -> Dict[str, Any]:
+        return {
+            "status": "insufficient_context",
+            "repo_summary": "",
+            "diagram_level": diagram_level,
+            "walkthrough": [],
+        }

@@ -2,10 +2,10 @@
 import { useState, useEffect, useMemo } from "react";
 
 // ── Layout constants ──────────────────────────────────────────────────────────
-const NODE_W = 160;
-const NODE_H = 64;
-const H_GAP = 200; // gap between right edge of one layer and left edge of next
-const V_GAP = 80;  // gap between bottom of one node and top of next
+const NODE_W = 140;
+const NODE_H = 48;
+const H_GAP = 200; // horizontal space between layers
+const V_GAP = 12;  // vertical gap between nodes — tight
 const PAD = 60;
 
 // ── Build-status overlay styles ───────────────────────────────────────────────
@@ -27,61 +27,97 @@ const FILE_TYPE_BADGE = {
 
 // ── Topological layer layout ──────────────────────────────────────────────────
 function computeLayout(nodes, edges) {
-  if (!nodes || nodes.length === 0) {
-    return { positions: {}, svgWidth: 400, svgHeight: 200 };
-  }
+  if (!nodes || nodes.length === 0) return {}
 
-  const nodeIds = new Set(nodes.map(n => n.id));
-  const inDegree = {};
-  const adj = {};
-  nodes.forEach(n => { inDegree[n.id] = 0; adj[n.id] = []; });
+  // Build adjacency: outgoing edges and incoming count per node
+  const outgoing = {}
+  const incomingCount = {}
+  nodes.forEach(n => {
+    outgoing[n.id] = []
+    incomingCount[n.id] = 0
+  })
   edges.forEach(e => {
-    if (nodeIds.has(e.source) && nodeIds.has(e.target)) {
-      inDegree[e.target] = (inDegree[e.target] || 0) + 1;
-      if (adj[e.source]) adj[e.source].push(e.target);
-    }
-  });
+    if (outgoing[e.source] !== undefined) outgoing[e.source].push(e.target)
+    if (incomingCount[e.target] !== undefined) incomingCount[e.target]++
+  })
 
-  // BFS layering — layer 0 = nodes with no incoming edges
-  const layers = [];
-  let queue = nodes.filter(n => inDegree[n.id] === 0).map(n => n.id);
-  if (queue.length === 0) queue = [nodes[0].id]; // fallback
-  const visited = new Set(queue);
+  // Kahn's algorithm — assign each node a layer number
+  const layer = {}
+  const queue = nodes.filter(n => incomingCount[n.id] === 0).map(n => n.id)
 
-  while (queue.length > 0) {
-    layers.push([...queue]);
-    const next = [];
-    queue.forEach(id => {
-      (adj[id] || []).forEach(child => {
-        if (!visited.has(child)) {
-          visited.add(child);
-          next.push(child);
+  if (queue.length === 0) {
+    // All nodes in a cycle — put everything in layer 0
+    nodes.forEach(n => { layer[n.id] = 0 })
+  } else {
+    queue.forEach(id => { layer[id] = 0 })
+    const visited = new Set(queue)
+    let head = 0
+    while (head < queue.length) {
+      const current = queue[head++]
+      const currentLayer = layer[current]
+      ;(outgoing[current] || []).forEach(targetId => {
+        const newLayer = currentLayer + 1
+        if (layer[targetId] === undefined || layer[targetId] < newLayer) {
+          layer[targetId] = newLayer
         }
-      });
-    });
-    queue = next;
+        if (!visited.has(targetId)) {
+          visited.add(targetId)
+          queue.push(targetId)
+        }
+      })
+    }
+    // Disconnected nodes fall into layer 0
+    nodes.forEach(n => { if (layer[n.id] === undefined) layer[n.id] = 0 })
   }
 
-  // Any disconnected nodes go in a final layer
-  const unvisited = nodes.filter(n => !visited.has(n.id)).map(n => n.id);
-  if (unvisited.length > 0) layers.push(unvisited);
+  // Group nodes by layer
+  const layerGroups = {}
+  nodes.forEach(n => {
+    const l = layer[n.id]
+    if (!layerGroups[l]) layerGroups[l] = []
+    layerGroups[l].push(n.id)
+  })
 
-  const maxLayerSize = Math.max(...layers.map(l => l.length));
-  const svgWidth  = layers.length * (NODE_W + H_GAP) - H_GAP + 2 * PAD;
-  const svgHeight = maxLayerSize * (NODE_H + V_GAP)  - V_GAP  + 2 * PAD;
+  // Assign x/y positions — top-left corner, w/h for bounds
+  const positions = {}
+  const layerKeys = Object.keys(layerGroups).map(Number).sort((a, b) => a - b)
 
-  // Assign positions (center-based) — each layer is vertically centered
-  const positions = {};
-  layers.forEach((layer, li) => {
-    const cx = PAD + NODE_W / 2 + li * (NODE_W + H_GAP);
-    const layerH = layer.length * (NODE_H + V_GAP) - V_GAP;
-    const startY = (svgHeight - layerH) / 2 + NODE_H / 2;
-    layer.forEach((id, ni) => {
-      positions[id] = { x: cx, y: startY + ni * (NODE_H + V_GAP) };
-    });
-  });
+  if (layerKeys.length === 1) {
+    // Grid layout for disconnected graphs (all nodes in one layer)
+    const group = layerGroups[layerKeys[0]]
+    const COLS = 3
+    const COL_W = NODE_W + 16
+    const ROW_H = NODE_H + 12
 
-  return { positions, svgWidth, svgHeight };
+    group.forEach((id, i) => {
+      const col = i % COLS
+      const row = Math.floor(i / COLS)
+      positions[id] = {
+        x: PAD + col * COL_W,
+        y: PAD + row * ROW_H,
+        w: NODE_W,
+        h: NODE_H,
+      }
+    })
+  } else {
+    // Layered layout for graphs with edges
+    layerKeys.forEach((l, layerIndex) => {
+      const group = layerGroups[l]
+      const x = PAD + layerIndex * (NODE_W + H_GAP)
+      const totalHeight = group.length * NODE_H + (group.length - 1) * V_GAP
+      const startY = PAD + Math.max(0, (500 - totalHeight) / 2)
+      group.forEach((id, i) => {
+        positions[id] = {
+          x,
+          y: startY + i * (NODE_H + V_GAP),
+          w: NODE_W,
+          h: NODE_H,
+        }
+      })
+    })
+  }
+
+  return positions
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -110,10 +146,21 @@ export default function VegaDiagram({
     setBlastSet(new Set());
   }, [nodes]);
 
-  const { positions, svgWidth, svgHeight } = useMemo(
+  const positions = useMemo(
     () => computeLayout(nodes, edges),
     [nodes, edges]
   );
+
+  // Compute SVG canvas size from actual node positions
+  const allPos = Object.values(positions);
+  let svgWidth, svgHeight;
+  if (allPos.length > 0) {
+    svgWidth  = Math.max(...allPos.map(p => p.x + p.w)) + PAD;
+    svgHeight = Math.max(...allPos.map(p => p.y + p.h)) + PAD;
+  } else {
+    svgWidth  = 800;
+    svgHeight = 600;
+  }
 
   // Build downstream adjacency for blast-radius calculation
   const downAdj = useMemo(() => {
@@ -173,7 +220,7 @@ export default function VegaDiagram({
   const edgeDelay = nodes.length * 50 + 100;
 
   return (
-    <div style={{ width: "100%", height: "100%", minHeight: 200, background: "#000", overflow: "auto" }}>
+    <div style={{ width: "100%", height: "100%", overflow: "auto", background: "#000000", position: "relative" }}>
       {/* CSS keyframes — scoped via unique class prefix */}
       <style>{`
         @keyframes vegaPulse {
@@ -181,8 +228,8 @@ export default function VegaDiagram({
           50%       { filter: drop-shadow(0 0 8px #06b6d4); }
         }
         @keyframes vegaNodeIn {
-          from { opacity: 0; transform: translateY(6px); }
-          to   { opacity: 1; transform: translateY(0); }
+          from { opacity: 0; }
+          to   { opacity: 1; }
         }
         @keyframes vegaEdgeIn {
           from { opacity: 0; }
@@ -191,10 +238,8 @@ export default function VegaDiagram({
       `}</style>
 
       <svg
-        width={svgWidth}
-        height={svgHeight}
         viewBox={`0 0 ${svgWidth} ${svgHeight}`}
-        style={{ display: "block" }}
+        style={{ display: "block", minWidth: "100%", minHeight: "100%" }}
       >
         <defs>
           {/* Dot-grid texture */}
@@ -213,15 +258,13 @@ export default function VegaDiagram({
           const tgt = positions[edge.target];
           if (!src || !tgt) return null;
 
-          // Exit right edge of source, enter left edge of target
-          const sx = src.x + NODE_W / 2;
-          const sy = src.y;
-          const tx = tgt.x - NODE_W / 2;
-          const ty = tgt.y;
-
-          // Cubic bezier control points — offset horizontally
-          const cp = Math.max(60, Math.abs(tx - sx) * 0.4);
-          const d = `M ${sx} ${sy} C ${sx + cp} ${sy}, ${tx - cp} ${ty}, ${tx} ${ty}`;
+          // source node right-center → target node left-center
+          const sx = src.x + src.w;
+          const sy = src.y + src.h / 2;
+          const tx = tgt.x;
+          const ty = tgt.y + tgt.h / 2;
+          const cx = (sx + tx) / 2;
+          const d = `M ${sx} ${sy} C ${cx} ${sy}, ${cx} ${ty}, ${tx} ${ty}`;
 
           return (
             <g
@@ -251,8 +294,8 @@ export default function VegaDiagram({
           const pos = positions[node.id];
           if (!pos) return null;
 
-          const nx = pos.x - NODE_W / 2;
-          const ny = pos.y - NODE_H / 2;
+          const nx = pos.x;
+          const ny = pos.y;
 
           const isVoiceHighlighted = highlightedNodes.includes(node.id);
           const isSelected         = selectedNode === node.id;
@@ -282,8 +325,8 @@ export default function VegaDiagram({
             : (node.accent_color || "#374151");
 
           const badge    = FILE_TYPE_BADGE[node.file_type] || "FILE";
-          const labelTxt = node.label.length > 17
-            ? node.label.slice(0, 15) + "…"
+          const labelTxt = node.label.length > 18
+            ? node.label.slice(0, 16) + "…"
             : node.label;
 
           // Animation: pulse takes priority over mount (mount is already complete by then)
@@ -313,7 +356,7 @@ export default function VegaDiagram({
               <rect
                 width={NODE_W}
                 height={NODE_H}
-                rx="6"
+                rx="8"
                 fill={fill}
                 stroke={borderStroke}
                 strokeWidth="1"
@@ -331,24 +374,25 @@ export default function VegaDiagram({
 
               {/* File type badge (top-left, muted) */}
               <text
-                x="10"
-                y="17"
+                x="12"
+                y="18"
                 fill="rgba(255,255,255,0.30)"
-                fontSize="8"
+                fontSize="9"
                 fontFamily="monospace"
                 fontWeight="600"
-                letterSpacing="0.8"
+                letterSpacing="0.08em"
               >
                 {badge}
               </text>
 
               {/* Node label */}
               <text
-                x="10"
+                x="12"
                 y="38"
-                fill="white"
+                fill="rgba(255,255,255,0.9)"
                 fontSize="12"
                 fontFamily="monospace"
+                fontWeight="bold"
               >
                 {labelTxt}
               </text>
@@ -356,10 +400,10 @@ export default function VegaDiagram({
               {/* Build-status overlay badge (top-right) */}
               {bsStyle && (
                 <text
-                  x={NODE_W - 8}
-                  y="17"
+                  x={NODE_W - 10}
+                  y="18"
                   fill={bsStyle.labelColor}
-                  fontSize="7"
+                  fontSize="8"
                   fontFamily="monospace"
                   fontWeight="700"
                   textAnchor="end"
@@ -373,7 +417,7 @@ export default function VegaDiagram({
                 <rect
                   width={NODE_W}
                   height={NODE_H}
-                  rx="6"
+                  rx="8"
                   fill="none"
                   stroke="#06b6d4"
                   strokeWidth="1.5"

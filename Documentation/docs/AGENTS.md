@@ -13,15 +13,15 @@ Vega uses 9 agents total — 1 Orchestrator and 8 specialized agents split acros
 > [!NOTE] Role
 > The central routing brain of Vega — receives every transcribed voice input, classifies intent, maintains session memory, and spawns the appropriate mode agents with full context.
 
-| Property | Value |
-|---|---|
-| Mode | Both |
-| Model | Nova 2 Lite |
-| Input | Transcribed voice text (string) + session memory object |
-| Output | Structured task object dispatched to Dev Mode or Ops Mode agents |
-| Tools Available | Intent classifier, session memory store, agent spawner, Nova Sonic confirmation trigger |
-| Spawned By | System (on session start via `POST /session/start`) |
-| Spawns | Code Review Agent, Security Audit Agent, Architecture Analysis Agent, PR Review Agent (Dev Mode) / Incident Analysis Agent, Log Parsing Agent, Root Cause Agent, Fix Draft Agent (Ops Mode) |
+| Property        | Value                                                                                                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mode            | Both                                                                                                                                                                                        |
+| Model           | Nova 2 Lite                                                                                                                                                                                 |
+| Input           | Transcribed voice text (string) + session memory object                                                                                                                                     |
+| Output          | Structured task object dispatched to Dev Mode or Ops Mode agents                                                                                                                            |
+| Tools Available | Intent classifier, session memory store, agent spawner, Nova Sonic confirmation trigger                                                                                                     |
+| Spawned By      | System (on session start via `POST /session/start`)                                                                                                                                         |
+| Spawns          | Code Review Agent, Security Audit Agent, Architecture Analysis Agent, PR Review Agent (Dev Mode) / Incident Analysis Agent, Log Parsing Agent, Root Cause Agent, Fix Draft Agent (Ops Mode) |
 
 **Behavior Notes:**
 - Classifies every input into one of: `dev_code_review`, `dev_security_audit`, `dev_architecture`, `dev_pr_review`, `ops_incident`, `ops_followup`, or `ambiguous`. On `ambiguous`, asks a clarifying voice question before spawning any agents.

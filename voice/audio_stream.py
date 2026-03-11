@@ -317,8 +317,7 @@ class AudioStreamSession:
             else:
                 # Phase 4+: Orchestrator pipeline — intent classification + agent dispatch
                 async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
-                    result = await asyncio.to_thread(
-                        self.orchestrator.process_turn,
+                    result = await self.orchestrator.process_turn(
                         self.session_id,
                         transcript,
                     )
@@ -389,7 +388,7 @@ class AudioStreamSession:
             logger.error(f"Orchestrator error for session {self.session_id}: {e}")
             await self.callbacks.on_error({
                 "type":    "error",
-                "code":    "AGENT_TIMEOUT",
+                "code":    "ORCHESTRATOR_ERROR",
                 "message": str(e),
             })
             self.state = SessionState.IDLE
@@ -443,78 +442,45 @@ class AudioStreamSession:
 
     async def speak(self, text: str, highlighted_nodes: Optional[list[str]] = None):
         """
-        Mark the session as speaking. TTS audio is delivered asynchronously via
-        _handle_tts_audio() as Nova Sonic emits BidiAudioStreamEvents on the
-        persistent bidirectional session — no separate synthesize() call needed.
+        Send the agent's voice response text to the WebSocket client.
+
+        TTS audio is delivered asynchronously via _handle_tts_audio() as Nova
+        Sonic emits BidiAudioStreamEvents on the persistent bidirectional
+        session. This method additionally sends the raw text as a
+        text_response frame so the front-end can display it immediately.
         """
         self.state = SessionState.SPEAKING
         self._playback_buffer.clear()
         self._playback_buffer_flushed = False
 
+        # Send the text content to the client as a displayable frame
+        try:
+            await self.callbacks.on_transcript({
+                "type":     "text_response",
+                "text":     text,
+                "is_final": True,
+            })
+        except Exception as exc:
+            logger.error(f"[{self.session_id}] Failed to send text_response: {exc}")
+
     async def speak_sentence_list(self, sentences: list[dict]):
         """
         Synthesize a codebase explorer walkthrough sentence list.
         TTS audio arrives via _handle_tts_audio() from Nova Sonic audio events.
+        Sends each sentence's text as a transcript frame for display.
         """
         self.state = SessionState.SPEAKING
-
-    async def _emit_audio_chunk(self, chunk: AudioChunkEvent):
-        """
-        Emit an audio chunk to the client, respecting the 300ms pre-playback buffer.
-
-        Buffer rule (Architecture spec §8):
-          - Accumulate chunks until BUFFER_BYTES is reached
-          - Once flushed, stream subsequent chunks immediately
-          - is_final=True always flushes immediately
-        """
-        if chunk.is_final:
-            # Final chunk: flush any remaining buffer and signal completion
-            if self._playback_buffer and not self._playback_buffer_flushed:
-                await self.callbacks.on_response_audio({
-                    "type":  "response_audio",
-                    "chunk": AudioChunkEvent(
-                        audio_bytes=bytes(self._playback_buffer),
-                        is_final=False,
-                        highlighted_nodes=chunk.highlighted_nodes,
-                    ).to_base64(),
-                    "is_final":          False,
-                    "highlighted_nodes": [],
+        for sentence in sentences:
+            try:
+                await self.callbacks.on_transcript({
+                    "type":             "text_response",
+                    "text":             sentence.get("text", ""),
+                    "is_final":         False,
+                    "highlighted_nodes": sentence.get("highlighted_nodes", []),
                 })
-                self._playback_buffer.clear()
-
-            await self.callbacks.on_response_audio({
-                "type":             "response_audio",
-                "chunk":            "",
-                "is_final":         True,
-                "highlighted_nodes": [],
-            })
-            return
-
-        if self._playback_buffer_flushed:
-            # Buffer already flushed — stream directly
-            await self.callbacks.on_response_audio({
-                "type":             "response_audio",
-                "chunk":            chunk.to_base64(),
-                "is_final":         False,
-                "highlighted_nodes": chunk.highlighted_nodes,
-            })
-        else:
-            # Still buffering
-            self._playback_buffer.extend(chunk.audio_bytes)
-            if len(self._playback_buffer) >= BUFFER_BYTES:
-                # Buffer full — flush and mark as flushed
-                self._playback_buffer_flushed = True
-                await self.callbacks.on_response_audio({
-                    "type":  "response_audio",
-                    "chunk": AudioChunkEvent(
-                        audio_bytes=bytes(self._playback_buffer),
-                        is_final=False,
-                        highlighted_nodes=chunk.highlighted_nodes,
-                    ).to_base64(),
-                    "is_final":          False,
-                    "highlighted_nodes": [],
-                })
-                self._playback_buffer.clear()
+            except Exception as exc:
+                logger.error(f"[{self.session_id}] Failed to send sentence: {exc}")
+                break
 
     # ─── Interrupt ───────────────────────────────
 

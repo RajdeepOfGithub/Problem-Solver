@@ -4,8 +4,8 @@ import VegaDiagram from "./components/VegaDiagram";
 import ModeIndicator from "./components/ModeIndicator";
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API = "http://localhost:8000";
-const WS_BASE = "ws://localhost:8000";
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
 
 const SEVERITY_COLOR = {
   CRITICAL: "#ff3b30",
@@ -472,7 +472,7 @@ export default function VegaUI() {
       const d = await r.json();
       if (r.ok) {
         setSessionId(d.session_id);
-        setSessionToken(d.session_token || "demo-token");
+        setSessionToken(d.token);
         setMode(m);
         setMessages([]);
         setActions([]);
@@ -483,7 +483,7 @@ export default function VegaUI() {
         setIsTransitioning(false);
         modeFamilyRef.current = "dev";
         setRecentSessions(prev => [{ id: d.session_id, mode: m, time: new Date().toISOString() }, ...prev.slice(0, 9)]);
-        connectWS(d.session_id, d.session_token || "demo-token");
+        connectWS(d.session_id, d.token);
       }
     } catch (e) {
       alert("Failed to start session: " + e.message);

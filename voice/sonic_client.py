@@ -416,7 +416,7 @@ async def check_nova_sonic_connectivity() -> dict:
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         )
-        loop   = asyncio.get_event_loop()
+        loop   = asyncio.get_running_loop()
         models = await loop.run_in_executor(
             None,
             lambda: bedrock.list_foundation_models(

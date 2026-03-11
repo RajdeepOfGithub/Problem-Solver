@@ -21,11 +21,12 @@ Intent taxonomy (Phase 5):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -317,50 +318,88 @@ class OrchestratorAgent:
         )
         return parsed
 
-    def dispatch_to_agents(self, intent: str, context: dict) -> dict:  # noqa: C901
+    async def dispatch_to_agents(self, intent: str, context: dict) -> dict:  # noqa: C901
         """
         Route an intent to the appropriate agent pipeline.
 
-        Phase 4 implementation: logs which agent would be spawned and returns
-        a structured stub response. Real sub-agent calls land in Phase 5/6.
-
-        All returned dicts include:
-            - voice_response       (str)
-            - actions_proposed     (list)
-            - requires_confirmation (bool)
+        Dispatches to real agent implementations and returns structured
+        responses including voice_response, actions_proposed, and
+        requires_confirmation.
 
         Args:
             intent:  Classified intent string from classify_intent().
             context: Dict containing voice_text, classification, session_memory.
 
         Returns:
-            Stub response dict.
+            Response dict with voice_response, actions_proposed, requires_confirmation.
         """
-        # ── Phase 5 intents ──────────────────────────────────────────────────
+        voice_text = context.get("voice_text", "")
+        session_memory = context.get("session_memory", [])
 
+        # ── dev_explore ──────────────────────────────────────────────────────
         if intent == "dev_explore":
             logger.info("dispatch_to_agents: spawning CodebaseExplorerAgent")
-            return {
-                "voice_response": (
-                    "Let me walk you through the codebase. "
-                    "I'll give you an overview of the main modules and how they connect."
-                ),
-                "actions_proposed": [],
-                "requires_confirmation": False,
-            }
+            try:
+                from agents.dev_mode.codebase_explorer import CodebaseExplorerAgent
+                agent = CodebaseExplorerAgent()
+                result = await agent.analyze(
+                    voice_query=voice_text or "overview",
+                    file_tree=context.get("file_tree", []),
+                    import_graph=context.get("import_graph", {}),
+                    code_chunks=context.get("code_chunks", []),
+                    diagram_level=context.get("diagram_level", "file"),
+                    diagram_node_ids=context.get("diagram_node_ids", []),
+                )
+                walkthrough = result.get("walkthrough", [])
+                voice_parts = [step.get("sentence", "") for step in walkthrough if step.get("sentence")]
+                voice_response = " ".join(voice_parts) if voice_parts else result.get("repo_summary", "Here's an overview of the codebase.")
+                return {
+                    "voice_response": voice_response,
+                    "walkthrough": walkthrough,
+                    "repo_summary": result.get("repo_summary", ""),
+                    "diagram_level": result.get("diagram_level", "file"),
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: CodebaseExplorerAgent failed: %s", exc)
+                return {
+                    "voice_response": "Let me walk you through the codebase. I'll give you an overview of the main modules and how they connect.",
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
 
+        # ── dev_review (security audit) ──────────────────────────────────────
         if intent == "dev_review":
-            logger.info("dispatch_to_agents: routing to Dev Mode review agents")
-            return {
-                "voice_response": (
-                    "Starting code review. I'll analyze the indexed codebase for issues, "
-                    "security vulnerabilities, and architectural concerns."
-                ),
-                "findings": [],
-                "actions_proposed": [],
-                "requires_confirmation": False,
-            }
+            logger.info("dispatch_to_agents: routing to SecurityAuditAgent")
+            try:
+                from agents.dev_mode.security_audit import SecurityAuditAgent
+                agent = SecurityAuditAgent()
+                code_chunks = context.get("code_chunks", [])
+                dependency_files = context.get("dependency_files", "")
+                result = await agent.analyze(
+                    code_chunks=code_chunks,
+                    dependency_files=dependency_files,
+                    original_query=voice_text,
+                )
+                voice_summary = result.get("voice_summary", "Security audit complete.")
+                return {
+                    "voice_response": voice_summary,
+                    "findings": result.get("findings", []),
+                    "vulnerability_count": result.get("vulnerability_count", {}),
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: SecurityAuditAgent failed: %s", exc)
+                return {
+                    "voice_response": "I encountered an error running the security audit. Please try again.",
+                    "findings": [],
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
 
+        # ── dev_build ────────────────────────────────────────────────────────
         if intent == "dev_build":
             logger.info("dispatch_to_agents: spawning ProjectIntelligenceAgent")
             return {
@@ -372,56 +411,209 @@ class OrchestratorAgent:
                 "requires_confirmation": False,
             }
 
+        # ── ops_code_action ──────────────────────────────────────────────────
         if intent == "ops_code_action":
             logger.info("dispatch_to_agents: spawning CodeActionAgent — mode switched to ops")
-            mode_switch = context.get("classification", {}).get("mode_switch")
-            return {
-                "voice_response": (
-                    "Switching to action mode. I'll generate the code change and ask "
-                    "for your confirmation before writing anything."
-                ),
-                "actions_proposed": [],
-                "requires_confirmation": False,
-                "mode_switch": mode_switch,
-            }
+            try:
+                from agents.ops_mode.code_action import CodeActionAgent
+                agent = CodeActionAgent()
+                code_chunks = context.get("code_chunks", [])
+                file_tree = context.get("file_tree", [])
+                result = await agent.propose_action(
+                    voice_text=voice_text,
+                    file_tree=file_tree,
+                    code_chunks=code_chunks,
+                    session_context=session_memory,
+                )
+                mode_switch = context.get("classification", {}).get("mode_switch")
+                explanation = result.get("explanation", "Code action proposed.")
+                actions = []
+                if result.get("status") == "ok" and result.get("action_id"):
+                    actions.append({
+                        "action_id": result["action_id"],
+                        "type": result.get("action_type", "modify_file"),
+                        "description": explanation,
+                    })
+                return {
+                    "voice_response": explanation,
+                    "actions_proposed": actions,
+                    "requires_confirmation": bool(actions),
+                    "mode_switch": mode_switch,
+                    "code_action_result": result,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: CodeActionAgent failed: %s", exc)
+                mode_switch = context.get("classification", {}).get("mode_switch")
+                return {
+                    "voice_response": "I encountered an error generating the code action. Please try again.",
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                    "mode_switch": mode_switch,
+                }
 
-        # ── Phase 4 intents (kept for backwards compat) ────────────────────
+        # ── dev_security_audit ─────────────────────────────────────────────
+        if intent == "dev_security_audit":
+            logger.info("dispatch_to_agents: routing dev_security_audit → SecurityAuditAgent")
+            try:
+                from agents.dev_mode.security_audit import SecurityAuditAgent
+                agent = SecurityAuditAgent()
+                code_chunks = context.get("code_chunks", [])
+                result = await agent.analyze(
+                    code_chunks=code_chunks,
+                    original_query=voice_text,
+                )
+                return {
+                    "voice_response": result.get("voice_summary", "Security audit complete."),
+                    "findings": result.get("findings", []),
+                    "vulnerability_count": result.get("vulnerability_count", {}),
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: SecurityAuditAgent failed: %s", exc)
+                return {
+                    "voice_response": "I encountered an error running the security audit. Please try again.",
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
 
-        if intent in ("dev_security_audit", "dev_code_review", "dev_architecture", "dev_pr_review"):
-            # Map legacy intents → dev_review path
-            logger.info("dispatch_to_agents: legacy Dev Mode intent %r → dev_review", intent)
-            return {
-                "voice_response": (
-                    "Starting analysis. I'll review the indexed codebase and report findings."
-                ),
-                "findings": [],
-                "actions_proposed": [],
-                "requires_confirmation": False,
-            }
+        # ── dev_code_review ────────────────────────────────────────────────
+        if intent == "dev_code_review":
+            logger.info("dispatch_to_agents: routing dev_code_review → CodeReviewAgent")
+            try:
+                from agents.dev_mode.code_review import CodeReviewAgent
+                agent = CodeReviewAgent()
+                code_chunks = context.get("code_chunks", [])
+                result = await agent.analyze(
+                    code_chunks=code_chunks,
+                    original_query=voice_text,
+                    session_context=str(session_memory[-3:]) if session_memory else "",
+                )
+                return {
+                    "voice_response": result.get("summary", "Code review complete."),
+                    "findings": result.get("findings", []),
+                    "files_reviewed": result.get("files_reviewed", []),
+                    "complexity_score": result.get("complexity_score", 0),
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: CodeReviewAgent failed: %s", exc)
+                return {
+                    "voice_response": "I encountered an error running the code review. Please try again.",
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
 
+        # ── dev_architecture ───────────────────────────────────────────────
+        if intent == "dev_architecture":
+            logger.info("dispatch_to_agents: routing dev_architecture → ArchitectureAnalysisAgent")
+            try:
+                from agents.dev_mode.architecture_analysis import ArchitectureAnalysisAgent
+                agent = ArchitectureAnalysisAgent()
+                code_chunks = context.get("code_chunks", [])
+                readme_content = context.get("readme_content", "")
+                result = await agent.analyze(
+                    code_chunks=code_chunks,
+                    readme_content=readme_content,
+                    diagram_chunks=context.get("diagram_chunks"),
+                    original_query=voice_text,
+                )
+                return {
+                    "voice_response": result.get("voice_summary", "Architecture analysis complete."),
+                    "overall_health": result.get("overall_health", 0),
+                    "patterns_identified": result.get("patterns_identified", []),
+                    "concerns": result.get("concerns", []),
+                    "suggestions": result.get("suggestions", []),
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: ArchitectureAnalysisAgent failed: %s", exc)
+                return {
+                    "voice_response": "I encountered an error running the architecture analysis. Please try again.",
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+
+        # ── dev_pr_review ──────────────────────────────────────────────────
+        if intent == "dev_pr_review":
+            logger.info("dispatch_to_agents: routing dev_pr_review → PRReviewAgent")
+            try:
+                from agents.dev_mode.pr_review import PRReviewAgent
+                agent = PRReviewAgent()
+                code_chunks = context.get("code_chunks", [])
+                result = await agent.analyze(
+                    pr_diff=context.get("pr_diff", ""),
+                    pr_description=context.get("pr_description", ""),
+                    code_chunks=code_chunks,
+                    original_query=voice_text,
+                )
+                verdict = result.get("verdict", "comment")
+                actions = []
+                needs_confirm = False
+                if verdict in ("approve", "request_changes"):
+                    actions.append({
+                        "action_id": f"pr_review_{verdict}",
+                        "type": "pr_review",
+                        "description": f"Post PR review with verdict: {verdict}",
+                        "verdict": verdict,
+                    })
+                    needs_confirm = True
+                return {
+                    "voice_response": result.get("summary", "PR review complete."),
+                    "verdict": verdict,
+                    "breaking_changes_detected": result.get("breaking_changes_detected", False),
+                    "inline_comments": result.get("inline_comments", []),
+                    "missing_tests": result.get("missing_tests", False),
+                    "actions_proposed": actions,
+                    "requires_confirmation": needs_confirm,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: PRReviewAgent failed: %s", exc)
+                return {
+                    "voice_response": "I encountered an error running the PR review. Please try again.",
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+
+        # ── ops_incident ─────────────────────────────────────────────────────
         if intent == "ops_incident":
             logger.info("dispatch_to_agents: spawning IncidentAnalysisAgent")
-            return {
-                "voice_response": (
-                    "Incident received. I'm retrieving logs and starting root cause analysis."
-                ),
-                "incident": None,
-                "actions_proposed": [],
-                "requires_confirmation": False,
-            }
+            try:
+                from agents.ops_mode.incident import IncidentAnalysisAgent
+                agent = IncidentAnalysisAgent()
+                result = await agent.analyze(
+                    voice_text=voice_text,
+                    session_memory=session_memory,
+                )
+                voice_ack = result.get("voice_acknowledgement", "Incident received. Starting investigation.")
+                return {
+                    "voice_response": voice_ack,
+                    "incident": result.get("incident"),
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
+            except Exception as exc:
+                logger.error("dispatch_to_agents: IncidentAnalysisAgent failed: %s", exc)
+                return {
+                    "voice_response": "Incident received. I'm retrieving logs and starting root cause analysis.",
+                    "incident": None,
+                    "actions_proposed": [],
+                    "requires_confirmation": False,
+                }
 
+        # ── ops_followup ─────────────────────────────────────────────────────
         if intent == "ops_followup":
             logger.info("dispatch_to_agents: ops follow-up")
             return {
-                "voice_response": (
-                    "Got it. Following up on the previous analysis."
-                ),
+                "voice_response": "Got it. Following up on the previous analysis.",
                 "actions_proposed": [],
                 "requires_confirmation": False,
             }
 
+        # ── ambiguous ────────────────────────────────────────────────────────
         if intent == "ambiguous":
-            # Use the clarifying question surfaced by classify_intent
             clarifying = (
                 context.get("classification", {}).get("clarifying_question")
                 or "Could you clarify what you need help with?"
@@ -444,7 +636,7 @@ class OrchestratorAgent:
             "requires_confirmation": False,
         }
 
-    def process_turn(self, session_id: str, voice_text: str) -> dict:
+    async def process_turn(self, session_id: str, voice_text: str) -> dict:
         """
         Process a single voice turn end-to-end.
 
@@ -495,7 +687,7 @@ class OrchestratorAgent:
                     "intent": "ambiguous",
                 }
             else:
-                result = self.dispatch_to_agents(
+                result = await self.dispatch_to_agents(
                     classification["intent"],
                     {
                         "voice_text": voice_text,
@@ -585,39 +777,42 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    print("=" * 60)
-    print("orchestrator.py smoke test")
-    print("=" * 60)
+    async def _smoke_test():
+        print("=" * 60)
+        print("orchestrator.py smoke test")
+        print("=" * 60)
 
-    try:
-        agent = OrchestratorAgent()
-    except FileNotFoundError as exc:
-        print(f"\n[FATAL] {exc}", file=sys.stderr)
-        sys.exit(1)
-    except OrchestratorError as exc:
-        print(f"\n[FATAL] OrchestratorError during init: {exc}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            agent = OrchestratorAgent()
+        except FileNotFoundError as exc:
+            print(f"\n[FATAL] {exc}", file=sys.stderr)
+            sys.exit(1)
+        except OrchestratorError as exc:
+            print(f"\n[FATAL] OrchestratorError during init: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-    # Turn 1
-    print("\n[1] process_turn — Lambda 500 errors")
-    result1 = agent.process_turn(
-        "test_session",
-        "My Lambda auth function is returning 500 errors",
-    )
-    print(f"    voice_response:        {result1['voice_response']}")
-    print(f"    actions_proposed:      {result1['actions_proposed']}")
-    print(f"    requires_confirmation: {result1['requires_confirmation']}")
+        # Turn 1
+        print("\n[1] process_turn — Lambda 500 errors")
+        result1 = await agent.process_turn(
+            "test_session",
+            "My Lambda auth function is returning 500 errors",
+        )
+        print(f"    voice_response:        {result1['voice_response']}")
+        print(f"    actions_proposed:      {result1['actions_proposed']}")
+        print(f"    requires_confirmation: {result1['requires_confirmation']}")
 
-    # Turn 2
-    print("\n[2] process_turn — security audit")
-    result2 = agent.process_turn(
-        "test_session",
-        "Review my authentication module for security vulnerabilities",
-    )
-    print(f"    voice_response:        {result2['voice_response']}")
-    print(f"    actions_proposed:      {result2['actions_proposed']}")
-    print(f"    requires_confirmation: {result2['requires_confirmation']}")
+        # Turn 2
+        print("\n[2] process_turn — security audit")
+        result2 = await agent.process_turn(
+            "test_session",
+            "Review my authentication module for security vulnerabilities",
+        )
+        print(f"    voice_response:        {result2['voice_response']}")
+        print(f"    actions_proposed:      {result2['actions_proposed']}")
+        print(f"    requires_confirmation: {result2['requires_confirmation']}")
 
-    print(f"\n    Session memory entries after 2 turns: {len(agent.get_session_memory('test_session'))}")
+        print(f"\n    Session memory entries after 2 turns: {len(agent.get_session_memory('test_session'))}")
 
-    print("\norchestrator.py smoke test passed")
+        print("\norchestrator.py smoke test passed")
+
+    asyncio.run(_smoke_test())

@@ -116,6 +116,7 @@ def _fetch_log_events(
     start_ms: int,
     end_ms: int,
     filter_pattern: str,
+    max_events: int = 10_000,
 ) -> list[dict]:
     """
     Paginate through CloudWatch Logs filter_log_events for the given window.
@@ -126,6 +127,8 @@ def _fetch_log_events(
         start_ms:       Start of query window, millisecond epoch.
         end_ms:         End of query window, millisecond epoch.
         filter_pattern: CloudWatch filter pattern string (empty = all events).
+        max_events:     Maximum number of events to retrieve (default 10,000).
+                        Prevents unbounded memory growth on large log groups.
 
     Returns:
         List of raw event dicts: {timestamp, message, logStreamName}.
@@ -147,6 +150,13 @@ def _fetch_log_events(
     while True:
         response = client.filter_log_events(**kwargs)
         events.extend(response.get("events", []))
+        if len(events) >= max_events:
+            logger.warning(
+                "Hit max_events limit (%d) for log group %r — truncating.",
+                max_events, log_group,
+            )
+            events = events[:max_events]
+            break
         next_token = response.get("nextToken")
         if not next_token:
             break

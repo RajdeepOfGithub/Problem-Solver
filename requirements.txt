@@ -17,24 +17,17 @@ aws-sdk-bedrock-runtime # Required by strands BidiNovaSonicModel (direct bidirec
 faiss-cpu
 numpy
 
-# Orchestration
-langgraph
-
 # API
 fastapi
 uvicorn[standard]
 websockets
 python-multipart
 
-# Auth / Sessions
-python-jose[cryptography]   # JWT session tokens
-passlib[bcrypt]
-
 # GitHub
-PyGithub
 GitPython   # git (repo cloning in ingestion/repo_loader.py)
 
 # Utilities
 python-dotenv
 pydantic
 httpx
+requests

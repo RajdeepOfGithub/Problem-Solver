@@ -14,8 +14,8 @@ build/
 venv/
 env/
 
-# Vector store data
-data/faiss_index/
+# Data — cloned repos, FAISS index, all generated data
+data/
 
 # Node / frontend
 node_modules/

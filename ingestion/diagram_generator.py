@@ -264,8 +264,7 @@ def _validate_mermaid(mermaid: str) -> bool:
 
     Checks:
     1. Starts with 'flowchart' (case-insensitive)
-    2. Contains at least one '-->' edge
-    3. No unclosed square brackets [ or round brackets (
+    2. No unclosed square brackets [ or round brackets (
     """
     if not mermaid:
         return False
@@ -273,10 +272,6 @@ def _validate_mermaid(mermaid: str) -> bool:
     first_line = mermaid.strip().split("\n")[0].strip().lower()
     if not first_line.startswith("flowchart"):
         logger.debug("Mermaid validation failed: does not start with 'flowchart'")
-        return False
-
-    if "-->" not in mermaid:
-        logger.debug("Mermaid validation failed: no '-->' edges found")
         return False
 
     # Check balanced brackets — count opens vs closes

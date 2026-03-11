@@ -305,3 +305,42 @@ The following components are added to the table in Section 3:
 | Code Action Agent | Nova 2 Lite + GitHub API | Executes physical file changes (create, modify, refactor) — lives in Ops Mode, triggered by Dev→Ops auto-switch | User voice request + relevant code chunks + file tree | Unified diff + voice explanation + GitHub PR (after confirmation) |
 | Mode Switch Controller | Orchestrator logic | Detects execution intent in Dev Mode and triggers switch to Ops Mode, notifies frontend via WebSocket event | Intent classification output | `mode_switch` WebSocket event with `from` / `to` fields |
 | Two-Tone Diagram Generator | Nova Lite + Mermaid.js + file content scanner | Extends standard diagram with green/gray node classification based on file existence and content | Indexed file tree + .md doc files | Two-tone Mermaid flowchart |
+
+---
+
+## 🔄 Architecture Corrections (Mar 3, 2026)
+
+### Diagram System — Mermaid Replaced
+
+Section 3 Component Breakdown and Section 8 still reference Mermaid.js. **Mermaid has been removed entirely.** Corrections:
+
+| Old | New |
+|---|---|
+| "Repo Diagram Generator: Nova Lite + Mermaid.js" | "Repo Diagram Generator: Custom `VegaDiagram.jsx` React SVG component" |
+| Diagram output = "Valid Mermaid flowchart string" | Diagram output = `{ nodes: [...], edges: [...] }` structured JSON |
+| Section 8 Step 3: "Feed file tree to Nova Lite to generate Mermaid" | Removed — diagram is built programmatically from os.walk() + import graph |
+| Section 8 Step 4: "Validate Mermaid server-side" | Removed — no Mermaid validation needed |
+| Fallback: "plain text file tree view" | Still applies — VegaDiagram shows text file tree when nodes array is empty |
+
+VegaDiagram layout behavior:
+- Repos with edges → topological layer layout (left to right, nodes per layer stacked vertically with 16px gap)
+- Repos with NO edges (e.g. binary-only repos like Sentinel) → 3-column grid layout, compact, all nodes visible without scrolling
+- SVG viewBox auto-calculated from actual node positions + 60px padding
+- Scrollable container wrapper — never clips content
+
+### Codebase Explorer Agent — README Workflow Inference (Phase 6)
+
+**New behaviour note to add to Codebase Explorer Agent spec:**
+
+For repos where no Python import edges exist (e.g. ML projects with `.ipynb`, `.h5`, `.pkl` files that can't be statically parsed), the Codebase Explorer Agent **must infer workflow order from the README** rather than from the import graph.
+
+Inference approach:
+1. Read README via FAISS retrieval
+2. Nova Lite identifies the pipeline sequence described in natural language (e.g. "Step 1: collect data → Step 2: train model → Step 3: run monitor")
+3. Map each step to the corresponding file node in the diagram
+4. Generate `highlighted_nodes` sequence based on this inferred order, not import edges
+5. If README has no clear pipeline description, fall back to alphabetical file order and note this in the voice walkthrough
+
+This is **Phase 6 work** — not yet built. The current Phase 5 diagram correctly shows a grid for these repos (honest representation of "no known relationships"). The voice walkthrough will add the semantic layer in Phase 6.
+
+Affected repos: any project where all files are binary or non-Python (Jupyter notebooks, model files, data files, config-only Python projects).

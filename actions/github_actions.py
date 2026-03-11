@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import uuid
 from typing import Optional
 
 import requests
@@ -39,7 +40,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 GITHUB_API_BASE: str = "https://api.github.com"
-GITHUB_TOKEN: Optional[str] = os.getenv("GITHUB_TOKEN")
 
 _VALID_VERDICTS = {"APPROVE", "REQUEST_CHANGES", "COMMENT"}
 
@@ -58,8 +58,9 @@ class GitHubActionError(Exception):
 
 def _headers(accept: str = "application/vnd.github.v3+json") -> dict:
     """Build the Authorization + Accept headers for every request."""
+    token = os.getenv("GITHUB_TOKEN", "")
     return {
-        "Authorization": f"token {GITHUB_TOKEN}",
+        "Authorization": f"token {token}",
         "Accept": accept,
     }
 
@@ -99,7 +100,8 @@ def check_github_connection() -> bool:
     Returns:
         True if the token is valid and GitHub is reachable, False otherwise.
     """
-    if not GITHUB_TOKEN:
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
         logger.warning("check_github_connection: GITHUB_TOKEN is not set.")
         return False
     try:
@@ -371,6 +373,197 @@ def create_review(
         "Review submitted: id=%d state=%s — %s",
         result["review_id"], result["state"], result["url"],
     )
+    return result
+
+
+def create_or_update_file(
+    path: str,
+    content: str,
+    message: str,
+    branch: str = "main",
+    owner: str | None = None,
+    repo: str | None = None,
+) -> dict:
+    """
+    Create or update a single file in a GitHub repository.
+
+    ⚠️ DESTRUCTIVE — only call after safety gate confirmation.
+
+    Uses the GitHub Contents API (PUT /repos/{owner}/{repo}/contents/{path}).
+    If the file already exists, its SHA is fetched first for the update.
+
+    Args:
+        path:    File path relative to repo root.
+        content: Raw file content (will be base64-encoded).
+        message: Commit message.
+        branch:  Target branch. Defaults to 'main'.
+        owner:   Repository owner. Falls back to GITHUB_OWNER env var.
+        repo:    Repository name. Falls back to GITHUB_REPO env var.
+
+    Returns:
+        Dict with keys:
+            - url     (str, HTML URL of the file)
+            - sha     (str, blob SHA of the created/updated file)
+            - path    (str)
+
+    Raises:
+        GitHubActionError: On any non-2xx response from GitHub.
+    """
+    owner = owner or os.getenv("GITHUB_OWNER", "")
+    repo = repo or os.getenv("GITHUB_REPO", "")
+
+    if not owner or not repo:
+        raise GitHubActionError(
+            "create_or_update_file: owner and repo are required "
+            "(pass as args or set GITHUB_OWNER/GITHUB_REPO env vars)"
+        )
+
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}"
+    logger.info("create_or_update_file: PUT %s branch=%r", url, branch)
+
+    # Check if file already exists to get its SHA
+    existing_sha = None
+    try:
+        resp = requests.get(url, headers=_headers(), params={"ref": branch}, timeout=10)
+        if resp.status_code == 200:
+            existing_sha = resp.json().get("sha")
+    except Exception:
+        pass  # File doesn't exist yet — that's fine
+
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    payload: dict = {
+        "message": message,
+        "content": encoded,
+        "branch": branch,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    try:
+        response = requests.put(url, headers=_headers(), json=payload, timeout=15)
+    except requests.RequestException as exc:
+        raise GitHubActionError(f"create_or_update_file network error: {exc}") from exc
+
+    _raise_for_status(response, f"PUT /repos/{owner}/{repo}/contents/{path}")
+    data = response.json()
+
+    result = {
+        "url": data.get("content", {}).get("html_url", ""),
+        "sha": data.get("content", {}).get("sha", ""),
+        "path": path,
+    }
+    logger.info("File created/updated: %s — %s", path, result["url"])
+    return result
+
+
+def create_draft_pr_with_diff(
+    title: str,
+    body: str,
+    diff: str,
+    owner: str | None = None,
+    repo: str | None = None,
+    base: str = "main",
+) -> dict:
+    """
+    Create a draft PR by applying a unified diff on a new branch.
+
+    ⚠️ DESTRUCTIVE — only call after safety gate confirmation.
+
+    Creates a new branch from base, applies the diff by updating each
+    affected file, then opens a draft PR.
+
+    Args:
+        title: PR title.
+        body:  PR description (Markdown).
+        diff:  Unified diff string.
+        owner: Repository owner. Falls back to GITHUB_OWNER env var.
+        repo:  Repository name. Falls back to GITHUB_REPO env var.
+        base:  Base branch. Defaults to 'main'.
+
+    Returns:
+        Dict with keys:
+            - url       (str, HTML URL of the created PR)
+            - pr_number (int)
+            - branch    (str, the created branch name)
+
+    Raises:
+        GitHubActionError: On any non-2xx response from GitHub.
+    """
+    import hashlib
+    import time
+
+    owner = owner or os.getenv("GITHUB_OWNER", "")
+    repo = repo or os.getenv("GITHUB_REPO", "")
+
+    if not owner or not repo:
+        raise GitHubActionError(
+            "create_draft_pr_with_diff: owner and repo are required "
+            "(pass as args or set GITHUB_OWNER/GITHUB_REPO env vars)"
+        )
+
+    # Create a unique branch name
+    branch_suffix = uuid.uuid4().hex[:8]
+    branch_name = f"vega/fix-{branch_suffix}"
+
+    # Get the SHA of the base branch
+    ref_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{base}"
+    try:
+        resp = requests.get(ref_url, headers=_headers(), timeout=10)
+    except requests.RequestException as exc:
+        raise GitHubActionError(f"create_draft_pr_with_diff: failed to get base ref: {exc}") from exc
+
+    _raise_for_status(resp, f"GET base branch ref {base}")
+    base_sha = resp.json()["object"]["sha"]
+
+    # Create the new branch
+    create_ref_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs"
+    try:
+        resp = requests.post(
+            create_ref_url,
+            headers=_headers(),
+            json={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise GitHubActionError(f"create_draft_pr_with_diff: failed to create branch: {exc}") from exc
+
+    _raise_for_status(resp, f"Create branch {branch_name}")
+    logger.info("Created branch %s from %s (sha=%s)", branch_name, base, base_sha[:8])
+
+    # Parse diff to find modified files and their new content
+    # For each file in the diff, update it on the new branch
+    current_file = None
+    file_lines: dict[str, list[str]] = {}
+
+    for line in diff.split("\n"):
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            if current_file not in file_lines:
+                file_lines[current_file] = []
+        elif current_file and line.startswith("+") and not line.startswith("+++"):
+            file_lines[current_file].append(line[1:])
+
+    for file_path, lines in file_lines.items():
+        content = "\n".join(lines)
+        create_or_update_file(
+            path=file_path,
+            content=content,
+            message=f"{title} — update {file_path}",
+            branch=branch_name,
+            owner=owner,
+            repo=repo,
+        )
+
+    # Create the draft PR
+    result = create_draft_pr(
+        owner=owner,
+        repo=repo,
+        title=title,
+        body=body,
+        head=branch_name,
+        base=base,
+    )
+    result["branch"] = branch_name
     return result
 
 

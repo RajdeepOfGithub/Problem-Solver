@@ -21,16 +21,17 @@ Phase 5: mode_switch WebSocket frame emitted on Dev→Ops transitions.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
+import boto3
 from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks,
@@ -42,7 +43,8 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, field_validator
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, field_validator
 
 from voice.audio_stream import AudioStreamSession, StreamCallbacks
 from voice.sonic_client import check_nova_sonic_connectivity
@@ -61,6 +63,7 @@ REQUIRE_CONFIRMATION = os.getenv("REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_ACTIONS",
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 SERVER_START_TIME = time.monotonic()
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
 
 # ─────────────────────────────────────────────
@@ -99,11 +102,17 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount frontend static files — must come after all route definitions
+# in the source but is registered at import time. Path "/" is a catch-all
+# so FastAPI routes take priority, static files serve what's left.
+if os.path.isdir("frontend"):
+    app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 
 # ─────────────────────────────────────────────
@@ -111,9 +120,8 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 
 def _generate_token(session_id: str) -> str:
-    """Generate a simple session token (replace with JWT in production)."""
-    payload = f"{session_id}:{API_SECRET_KEY}:{int(time.time())}"
-    return hashlib.sha256(payload.encode()).hexdigest()
+    """Generate a cryptographically secure random session token."""
+    return secrets.token_urlsafe(32)
 
 
 def _validate_bearer_token(authorization: str) -> Optional[str]:
@@ -200,8 +208,11 @@ async def websocket_voice(websocket: WebSocket):
     A session must be created via POST /session/start before connecting.
     """
     # Validate auth at handshake.
-    # Browser WebSocket cannot send custom headers, so fall back to ?token= query param
-    # (used by the dev test console at frontend/test_voice.html).
+    # ⚠️ SECURITY NOTE: Browser WebSocket API cannot send custom headers.
+    # The ?token= query param fallback is used by the dev test console at
+    # frontend/test_voice.html. Query-param tokens are visible in server logs,
+    # browser history, and proxy logs. In production, implement a short-lived
+    # one-time ticket exchange (POST /session/ws-ticket) instead.
     auth_header = websocket.headers.get("Authorization", "") or \
         f"Bearer {websocket.query_params.get('token', '')}"
     session_id = _validate_bearer_token(auth_header)
@@ -357,14 +368,13 @@ async def _handle_control_message(
 async def start_repo_index(
     request: RepoIndexRequest,
     background_tasks: BackgroundTasks,
+    session_id: str = Depends(_require_auth),
 ):
     """
     Trigger GitHub repo ingestion — clone, chunk, embed, store in FAISS.
     Returns a job_id to poll via GET /repo/status/{job_id}.
+    Requires authentication.
     """
-    # Validate the repo URL
-    if not request.repo_url.startswith("https://github.com/"):
-        raise HTTPException(status_code=422, detail="Invalid repo URL format")
 
     job_id = f"idx_{uuid.uuid4().hex[:8]}"
     _indexing_jobs[job_id] = {
@@ -418,7 +428,7 @@ async def _run_indexing_job(
 
         # Step 1: Clone and chunk — use load_repo_to_dir to persist for DocScanner
         repo_dir = os.path.join("data", "repos", job_id)
-        chunks, repo_path, import_graph = await asyncio.get_event_loop().run_in_executor(
+        chunks, repo_path, import_graph = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: load_repo_to_dir(
                 repo_url,
@@ -448,7 +458,7 @@ async def _run_indexing_job(
             return
 
         # Step 2: Generate embeddings
-        embedded_chunks = await asyncio.get_event_loop().run_in_executor(
+        embedded_chunks = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: embed_chunks(chunks),
         )
@@ -456,7 +466,7 @@ async def _run_indexing_job(
 
         # Step 3: Store in FAISS
         vector_store = VectorStore()
-        await asyncio.get_event_loop().run_in_executor(
+        await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: vector_store.index_chunks(embedded_chunks, index_id=job_id),
         )
@@ -465,12 +475,11 @@ async def _run_indexing_job(
             "progress": 80,
         })
 
-        # Step 4: Generate Mermaid diagram
+        # Step 4: Generate diagram — walk disk, not FAISS index
         diagram_result = await _generate_repo_diagram(
             job_id=job_id,
-            file_tree=file_tree,
+            repo_local_path=repo_path,
             import_graph=import_graph,
-            file_count=file_count,
         )
         _indexing_jobs[job_id].update(diagram_result)
         _indexing_jobs[job_id].update({
@@ -489,21 +498,42 @@ async def _run_indexing_job(
 
 async def _generate_repo_diagram(
     job_id: str,
-    file_tree: list[str],
+    repo_local_path: str,
     import_graph: dict,
-    file_count: int,
 ) -> dict:
     """
-    Generate nodes/edges graph from the file tree and import graph.
-    Also produces Mermaid text (kept internally for two-tone endpoint compatibility).
+    Generate nodes/edges graph by walking the cloned repo directory on disk.
+    Uses ALL files (including binary/notebook/model files), not just FAISS-indexed ones.
+    FAISS is for semantic search; the diagram needs the full file tree.
     """
     import re
 
-    # Determine diagram level (Architecture spec §8)
+    _SKIP_DIRS = {
+        ".git", "__pycache__", "node_modules", ".ipynb_checkpoints",
+        ".venv", "venv", "env", "dist", "build", ".idea", ".vscode",
+    }
+    _MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB — skip model checkpoints, etc.
+
+    # Walk disk — source of truth for the diagram
+    all_files: list[str] = []
+    for root, dirs, files in os.walk(repo_local_path):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+        for filename in files:
+            if filename.startswith("."):
+                continue
+            filepath = os.path.join(root, filename)
+            try:
+                if os.path.getsize(filepath) > _MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            rel_path = os.path.relpath(filepath, repo_local_path).replace(os.sep, "/")
+            all_files.append(rel_path)
+
+    file_count = len(all_files)
     diagram_level = "file" if file_count <= 30 else "folder"
 
     def _sanitize(s: str) -> str:
-        """Replace any non-alphanumeric character with underscore."""
         return re.sub(r"[^A-Za-z0-9]", "_", s).strip("_") or "node"
 
     def _file_type_info(path: str) -> tuple[str, str]:
@@ -522,7 +552,47 @@ async def _generate_repo_diagram(
             return "python", "#4338ca"
         if any(name.endswith(ext) for ext in (".js", ".ts", ".jsx", ".tsx")):
             return "javascript", "#b45309"
-        return "file", "#334155"  # catch-all: slate
+        return "file", "#334155"
+
+    # JS/TS import edges — parse relative imports from .js/.ts/.jsx/.tsx files
+    _JS_EXTS = {".js", ".ts", ".jsx", ".tsx"}
+    _JS_IMPORT_RE = re.compile(
+        r'''(?:import\s+.*?\s+from\s+['"](\.[^'"]+)['"]'''
+        r'''|import\s*\(\s*['"](\.[^'"]+)['"]\s*\)'''
+        r'''|require\s*\(\s*['"](\.[^'"]+)['"]\s*\))''',
+    )
+    all_files_set = set(all_files)
+    for src_path in all_files:
+        ext = os.path.splitext(src_path)[1]
+        if ext not in _JS_EXTS:
+            continue
+        abs_src = os.path.join(repo_local_path, src_path)
+        try:
+            with open(abs_src, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read(32_000)
+        except OSError:
+            continue
+        src_dir = os.path.dirname(src_path)
+        for m in _JS_IMPORT_RE.finditer(content):
+            raw = m.group(1) or m.group(2) or m.group(3)
+            resolved = os.path.normpath(os.path.join(src_dir, raw)).replace(os.sep, "/")
+            matched = None
+            if resolved in all_files_set:
+                matched = resolved
+            else:
+                for try_ext in _JS_EXTS:
+                    candidate = resolved + try_ext
+                    if candidate in all_files_set:
+                        matched = candidate
+                        break
+                if not matched and resolved + "/index.js" in all_files_set:
+                    matched = resolved + "/index.js"
+                if not matched and resolved + "/index.ts" in all_files_set:
+                    matched = resolved + "/index.ts"
+            if matched and matched != src_path:
+                import_graph.setdefault(src_path, [])
+                if matched not in import_graph[src_path]:
+                    import_graph[src_path].append(matched)
 
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -534,14 +604,12 @@ async def _generate_repo_diagram(
         # ── File-level: one node per file, folder --> file edges ───────────────
         lines = ["flowchart TD"]
 
-        # Collect folders
         folders: set[str] = set()
-        for path in file_tree[:40]:
+        for path in all_files:
             parts = path.split("/")
             if len(parts) > 1:
                 folders.add(parts[0])
 
-        # Emit folder nodes
         for folder in sorted(folders):
             nid = _sanitize(folder)
             lines.append(f'    {nid}["{folder}/"]')
@@ -555,8 +623,7 @@ async def _generate_repo_diagram(
                 "metadata": {"path": folder + "/", "imports": []},
             })
 
-        # Emit file nodes + folder --> file edges
-        for path in file_tree[:40]:
+        for path in all_files:
             parts = path.split("/")
             file_nid = _sanitize(path)
             label = parts[-1]
@@ -583,7 +650,7 @@ async def _generate_repo_diagram(
                     "label": "contains",
                 })
 
-        # Add import edges (skip circular / unknown)
+        # Import edges (Python + JS/TS — import_graph includes both)
         seen_edges: set[tuple[str, str]] = set()
         for src, targets in list(import_graph.items())[:30]:
             src_nid = _sanitize(src)
@@ -611,7 +678,7 @@ async def _generate_repo_diagram(
         lines = ["flowchart TD"]
 
         folder_files: dict[str, list[str]] = {}
-        for path in file_tree[:100]:
+        for path in all_files:
             parts = path.split("/")
             top = parts[0] if len(parts) > 1 else "__root__"
             folder_files.setdefault(top, []).append(path)
@@ -631,7 +698,6 @@ async def _generate_repo_diagram(
                 "metadata": {"path": folder, "file_count": count, "imports": []},
             })
 
-        # Cross-folder import edges
         def _top_folder(p: str) -> str:
             parts = p.split("/")
             return parts[0] if len(parts) > 1 else "__root__"
@@ -662,11 +728,12 @@ async def _generate_repo_diagram(
 
     mermaid_text = "\n".join(lines)
     return {
-        "mermaid": mermaid_text,   # kept for two-tone endpoint
-        "node_ids": node_ids,      # kept for two-tone endpoint
+        "mermaid": mermaid_text,
+        "node_ids": node_ids,
         "nodes": nodes,
         "edges": edges,
         "diagram_level": diagram_level,
+        "file_count": file_count,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -724,7 +791,7 @@ async def get_two_tone_diagram(job_id: str):
 
         # Retrieve chunks to reconstruct md_contents
         vector_store = VectorStore()
-        chunks = await asyncio.get_event_loop().run_in_executor(
+        chunks = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: vector_store.get_all_chunks(index_id=job_id),
         )
@@ -740,7 +807,7 @@ async def get_two_tone_diagram(job_id: str):
 
         # Run DocScanner
         scanner = DocScanner()
-        scan_result = await asyncio.get_event_loop().run_in_executor(
+        scan_result = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: scanner.scan_repo(
                 file_tree=file_tree,
@@ -801,9 +868,6 @@ async def get_repo_diagram(job_id: str):
 
     if job["status"] != "complete":
         raise HTTPException(status_code=404, detail="Indexing not yet complete")
-
-    if job.get("file_count", 0) > 100:
-        raise HTTPException(status_code=422, detail="Repo exceeded 100 file limit")
 
     if not job.get("nodes"):
         raise HTTPException(status_code=500, detail="Diagram generation failed")
@@ -869,6 +933,7 @@ async def start_session(request: SessionStartRequest):
 @app.post("/session/optimize")
 async def trigger_optimization(
     request: OptimizeRequest,
+    session_id: str = Depends(_require_auth),
 ):
     """
     Trigger the Project Intelligence Agent for the current session.
@@ -893,7 +958,7 @@ async def trigger_optimization(
 
         # Retrieve indexed chunks
         vector_store = VectorStore()
-        chunks = await asyncio.get_event_loop().run_in_executor(
+        chunks = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: vector_store.get_all_chunks(index_id=request.repo_id),
         )
@@ -918,7 +983,7 @@ async def trigger_optimization(
         # Run DocScanner
         scanner = DocScanner()
         repo_path = job.get("repo_path", ".")
-        scan_result = await asyncio.get_event_loop().run_in_executor(
+        scan_result = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: scanner.scan_repo(
                 file_tree=file_tree,
@@ -1026,17 +1091,71 @@ async def confirm_action(
         logger.info(f"Action cancelled: {action_id}")
         return {"action_id": action_id, "status": "cancelled"}
 
-    # Mark as executing and hand off to action layer (Phase 4)
+    # Mark as executing and hand off to action layer
     _actions[action_id].update({
         "status": "executing",
         "confirmed_at": datetime.now(timezone.utc).isoformat(),
     })
     logger.info(f"Action confirmed and executing: {action_id}")
 
-    # TODO Phase 4: dispatch to actions/github_actions.py or actions/aws_actions.py
-    # based on action["type"]
+    # Dispatch to the appropriate action handler
+    action_type = action.get("type", "")
+    exec_result = None
 
-    return {"action_id": action_id, "status": "executing"}
+    try:
+        if action_type in ("create_file", "modify_file", "refactor"):
+            from agents.ops_mode.code_action import CodeActionAgent
+            agent = CodeActionAgent()
+            action_result = action.get("code_action_result", {})
+            if not action_result:
+                action_result = {
+                    "action_id": action_id,
+                    "action_type": action_type,
+                    "proposed_change": action.get("proposed_change", ""),
+                    "target_file": action.get("target_file", ""),
+                    "proposed_pr_title": action.get("proposed_pr_title", ""),
+                    "proposed_pr_body": action.get("proposed_pr_body", ""),
+                }
+            exec_result = await agent.execute_action(action_result, confirmed=True)
+
+        elif action_type in ("create_issue", "github_issue"):
+            from actions import github_actions
+            issue_data = action.get("issue_data", {})
+            exec_result = github_actions.create_issue(
+                owner=issue_data.get("owner", ""),
+                repo=issue_data.get("repo", ""),
+                title=issue_data.get("title", ""),
+                body=issue_data.get("body", ""),
+                labels=issue_data.get("labels"),
+            )
+
+        elif action_type in ("create_pr", "draft_pr"):
+            from actions import github_actions
+            pr_data = action.get("pr_data", {})
+            exec_result = github_actions.create_draft_pr(
+                owner=pr_data.get("owner", ""),
+                repo=pr_data.get("repo", ""),
+                title=pr_data.get("title", ""),
+                body=pr_data.get("body", ""),
+                head=pr_data.get("head", ""),
+                base=pr_data.get("base", "main"),
+            )
+
+        else:
+            logger.warning(f"Unknown action type: {action_type}")
+            exec_result = {"status": "failed", "message": f"Unknown action type: {action_type}"}
+
+        _actions[action_id]["status"] = "success"
+        _actions[action_id]["result"] = exec_result
+        logger.info(f"Action {action_id} executed successfully")
+
+    except Exception as exc:
+        logger.error(f"Action {action_id} execution failed: {exc}")
+        _actions[action_id]["status"] = "failed"
+        _actions[action_id]["error"] = str(exc)
+        exec_result = {"status": "failed", "message": str(exc)}
+
+    return {"action_id": action_id, "status": _actions[action_id]["status"], "result": exec_result}
 
 
 # ─────────────────────────────────────────────
@@ -1049,9 +1168,22 @@ async def health_check():
     Server status + all external dependency connectivity.
     Use this to verify environment setup before a demo.
     """
-    import boto3
-
+    loop = asyncio.get_running_loop()
     uptime = int(time.monotonic() - SERVER_START_TIME)
+
+    # Build reusable boto3 clients for this health check
+    aws_region = os.getenv("AWS_REGION", "us-east-1")
+    aws_bedrock_region = os.getenv("AWS_BEDROCK_REGION", aws_region)
+    aws_key = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+    def _make_client(service: str, region: str = aws_region):
+        return boto3.client(
+            service,
+            region_name=region,
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret,
+        )
 
     # Check Nova Sonic
     sonic_status = await check_nova_sonic_connectivity()
@@ -1059,15 +1191,8 @@ async def health_check():
     # Check Bedrock (Nova Lite)
     bedrock_status = "disconnected"
     try:
-        bedrock = boto3.client(
-            "bedrock",
-            region_name=os.getenv("AWS_BEDROCK_REGION", "us-east-1"),
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
-        await asyncio.get_event_loop().run_in_executor(
-            None, bedrock.list_foundation_models
-        )
+        bedrock = _make_client("bedrock", aws_bedrock_region)
+        await loop.run_in_executor(None, bedrock.list_foundation_models)
         bedrock_status = "connected"
     except Exception as e:
         logger.warning(f"Bedrock health check failed: {e}")
@@ -1090,19 +1215,35 @@ async def health_check():
     # Check AWS (CloudWatch)
     aws_status = "disconnected"
     try:
-        logs = boto3.client(
-            "logs",
-            region_name=os.getenv("AWS_REGION", "us-east-1"),
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
-        await asyncio.get_event_loop().run_in_executor(
+        logs_client = _make_client("logs")
+        await loop.run_in_executor(
             None,
-            lambda: logs.describe_log_groups(limit=1),
+            lambda: logs_client.describe_log_groups(limit=1),
         )
         aws_status = "connected"
     except Exception:
         aws_status = "disconnected"
+
+    # Check Lambda
+    lambda_status = "disconnected"
+    try:
+        lam = _make_client("lambda")
+        await loop.run_in_executor(
+            None,
+            lambda: lam.list_functions(MaxItems=1),
+        )
+        lambda_status = "connected"
+    except Exception:
+        lambda_status = "disconnected"
+
+    # Check ECS
+    ecs_status = "disconnected"
+    try:
+        ecs = _make_client("ecs")
+        await loop.run_in_executor(None, ecs.list_clusters)
+        ecs_status = "connected"
+    except Exception:
+        ecs_status = "disconnected"
 
     # Check FAISS index
     faiss_index_path = os.getenv("FAISS_INDEX_PATH", "./data/faiss_index")
@@ -1117,6 +1258,9 @@ async def health_check():
         "nova_sonic": sonic_status.get("status", "disconnected"),
         "bedrock": bedrock_status,
         "github": github_status,
+        "cloudwatch": aws_status,
+        "lambda": lambda_status,
+        "ecs": ecs_status,
         "aws": aws_status,
         "faiss_index": faiss_status,
         "uptime_seconds": uptime,
@@ -1143,24 +1287,3 @@ if __name__ == "__main__":
         reload_excludes=["data/*", "*.log"],
         log_level="info",
     )
-
-# TEMP TEST — remove before Phase 4
-_indexing_jobs["test_job"] = {
-    "status": "complete", "file_count": 5,
-    "mermaid": "flowchart TD\n A --> B", "node_ids": [],
-    "nodes": [
-        {"id": "app.py", "label": "app", "file_type": "python", "node_type": "source",
-         "accent_color": "#4338ca", "metadata": {"path": "app.py", "imports": ["utils.py"]}},
-        {"id": "utils.py", "label": "utils", "file_type": "python", "node_type": "source",
-         "accent_color": "#4338ca", "metadata": {"path": "utils.py", "imports": []}},
-    ],
-    "edges": [
-        {"id": "e1", "source": "app.py", "target": "utils.py", "label": "imports"},
-    ],
-    "diagram_level": "file", "generated_at": "",
-    "chunks_indexed": 0, "total_chunks": 0,
-}
-
-
-from fastapi.staticfiles import StaticFiles
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

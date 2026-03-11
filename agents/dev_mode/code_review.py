@@ -1,8 +1,165 @@
-# code_review.py
-# Phase 5 — Code Review Agent
-# Model:   Nova 2 Lite via Bedrock
-# Prompt:  prompts/dev_mode/code_review.txt
-# Inputs:  code_chunks [{file, start_line, end_line, content}] + original_query + session_context
-# Outputs: JSON {status, findings[], summary, files_reviewed[], complexity_score}
-# Severity: CRITICAL | HIGH | MEDIUM | LOW
-# TODO: implement chunk analysis, cyclomatic complexity estimate, finding dedup
+"""
+agents/dev_mode/code_review.py
+Vega — Code Review Agent
+
+Analyzes code chunks for quality issues — complexity, anti-patterns,
+naming conventions, duplication, and maintainability. Returns findings
+ranked by severity with specific line references.
+
+Model:  Amazon Nova 2 Lite via Bedrock converse API
+Prompt: prompts/dev_mode/code_review.txt
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List
+
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+NOVA_LITE_MODEL_ID: str = os.getenv("NOVA_LITE_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
+AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+
+_PROMPT_PATH: Path = (
+    Path(__file__).parent.parent.parent / "prompts" / "dev_mode" / "code_review.txt"
+)
+
+
+class CodeReviewAgent:
+    """
+    Analyzes code for quality issues — complexity, anti-patterns, naming, duplication.
+
+    Usage::
+
+        agent = CodeReviewAgent()
+        result = await agent.analyze(
+            code_chunks=[...],
+            original_query="Review the auth module",
+            session_context="",
+        )
+    """
+
+    def __init__(self) -> None:
+        self._bedrock = boto3.client(
+            "bedrock-runtime",
+            region_name=AWS_REGION,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        )
+        self._system_prompt: str = self._load_system_prompt()
+
+    async def analyze(
+        self,
+        code_chunks: List[Dict],
+        original_query: str = "",
+        session_context: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Run a code quality review on the provided code chunks.
+
+        Args:
+            code_chunks:     List of code chunk dicts with {file, start_line, end_line, content}.
+            original_query:  The developer's original voice request.
+            session_context: Summary of prior findings in this session (may be empty).
+
+        Returns:
+            Dict matching code_review.txt output schema:
+            {status, findings, summary, files_reviewed, complexity_score}
+        """
+        prompt = self._build_prompt(code_chunks, original_query, session_context)
+
+        try:
+            response = await asyncio.to_thread(
+                self._bedrock.converse,
+                modelId=NOVA_LITE_MODEL_ID,
+                system=[{"text": self._system_prompt}],
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+            )
+            raw: str = response["output"]["message"]["content"][0]["text"].strip()
+            raw = self._strip_fences(raw)
+            result: Dict[str, Any] = json.loads(raw)
+
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            logger.error("CodeReviewAgent: Bedrock error (%s): %s", code, exc)
+            return self._error_response(str(exc))
+        except json.JSONDecodeError as exc:
+            logger.error("CodeReviewAgent: JSON parse error: %s", exc)
+            return self._error_response(f"Model returned invalid JSON: {exc}")
+        except Exception as exc:
+            logger.error("CodeReviewAgent: unexpected error: %s", exc)
+            return self._error_response(str(exc))
+
+        logger.info(
+            "CodeReviewAgent: review complete — %d findings, complexity=%s",
+            len(result.get("findings", [])),
+            result.get("complexity_score", "?"),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_prompt(
+        self,
+        code_chunks: List[Dict],
+        original_query: str,
+        session_context: str,
+    ) -> str:
+        parts: List[str] = [f"ORIGINAL QUERY: {original_query}"]
+
+        if session_context:
+            parts.append(f"\nSESSION CONTEXT (prior findings):\n{session_context[:2000]}")
+
+        parts.append("\nCODE CHUNKS:")
+        for chunk in code_chunks[:10]:
+            parts.append(
+                f"\n--- {chunk.get('file', 'unknown')} "
+                f"(lines {chunk.get('start_line', '?')}-{chunk.get('end_line', '?')}) ---"
+            )
+            parts.append(chunk.get("content", "")[:2000])
+
+        return "\n".join(parts)
+
+    def _load_system_prompt(self) -> str:
+        try:
+            return _PROMPT_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.warning("code_review.txt not found — using inline default")
+            return (
+                "You are Vega's Code Review Agent. Analyze code for quality issues. "
+                "Return valid JSON only matching the required schema."
+            )
+
+    @staticmethod
+    def _strip_fences(text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        return text.strip()
+
+    @staticmethod
+    def _error_response(message: str) -> Dict[str, Any]:
+        return {
+            "status": "insufficient_context",
+            "findings": [],
+            "summary": f"Code review could not complete: {message}",
+            "files_reviewed": [],
+            "complexity_score": 0,
+        }
